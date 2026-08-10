@@ -97,9 +97,12 @@ class AutomodelEngine(BaseEngine):
         apply_te_patches()
 
         world_size = torch.distributed.get_world_size()
-        self.distributed_config, self.device_mesh, self.moe_mesh = build_distributed_config_from_engine_config(
-            self.engine_config, world_size
-        )
+        (
+            self.distributed_setup,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+        ) = build_distributed_config_from_engine_config(self.engine_config, world_size)
 
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
@@ -129,7 +132,12 @@ class AutomodelEngine(BaseEngine):
     def initialize(self):
         """Build the model, optimizer, LR scheduler, and checkpointer using Automodel infrastructure."""
         self.module = build_automodel_model(
-            self.model_config, self.engine_config, self.distributed_config, self.device_mesh, self.moe_mesh
+            self.model_config,
+            self.engine_config,
+            self.distributed_setup,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
         )
         log_gpu_memory_usage("After Automodel model build", logger=logger)
 
@@ -154,14 +162,21 @@ class AutomodelEngine(BaseEngine):
         torch.cuda.empty_cache()
 
     def _build_optimizer(self, module):
-        """Build optimizer via Automodel's build_optimizer."""
-        from nemo_automodel.components.config.loader import ConfigNode
-        from nemo_automodel.recipes.llm.train_ft import build_optimizer as automodel_build_optimizer
+        """Build optimizer via Automodel's build_optimizer.
+
+        Automodel 0.5.0 changed ``build_optimizer`` to take a
+        ``(name_or_path, kwargs)`` tuple (or typed ``OptimizerConfig``) and a
+        keyword-only ``device_mesh=``; the ``distributed_config`` positional was
+        dropped. We honor the same ``optimizer_impl.optimizer`` dotted path verl
+        always assembled (e.g. ``transformer_engine.pytorch.optimizers.fused_adam``)
+        by passing it as the registry/import-path string.
+        """
+        from nemo_automodel.components.optim.optimizer import build_optimizer as automodel_build_optimizer
 
         config = self.optimizer_config
 
-        opt_dict = {
-            "_target_": f"{config.optimizer_impl}.{config.optimizer}",
+        optimizer_name = f"{config.optimizer_impl}.{config.optimizer}"
+        opt_kwargs = {
             "lr": config.lr,
             "weight_decay": config.weight_decay,
             "eps": config.eps,
@@ -169,21 +184,20 @@ class AutomodelEngine(BaseEngine):
         }
 
         if config.master_weights:
-            opt_dict["master_weights"] = config.master_weights
+            opt_kwargs["master_weights"] = config.master_weights
         if config.store_param_remainders:
-            opt_dict["store_param_remainders"] = config.store_param_remainders
+            opt_kwargs["store_param_remainders"] = config.store_param_remainders
 
         _short_to_torch = {"bf16": "torch.bfloat16", "fp32": "torch.float32", "fp16": "torch.float16"}
         for attr in ("exp_avg_dtype", "exp_avg_sq_dtype", "master_weight_dtype"):
             val = getattr(config, attr, None)
             if val is not None:
-                opt_dict[attr] = _short_to_torch.get(val, val)
+                opt_kwargs[attr] = _short_to_torch.get(val, val)
 
         if config.override_optimizer_config:
-            opt_dict.update(config.override_optimizer_config)
+            opt_kwargs.update(config.override_optimizer_config)
 
-        cfg_opt = ConfigNode(opt_dict)
-        optimizers = automodel_build_optimizer(module, cfg_opt, self.distributed_config, self.device_mesh)
+        optimizers = automodel_build_optimizer(module, (optimizer_name, opt_kwargs), device_mesh=self.device_mesh)
         assert len(optimizers) == 1, f"Expected 1 optimizer, got {len(optimizers)}"
         return optimizers[0]
 

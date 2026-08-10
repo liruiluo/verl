@@ -65,72 +65,109 @@ def maybe_fully_shard_optimizer(model, optimizer, distributed_config):
 
 
 def build_distributed_config_from_engine_config(engine_config, world_size):
-    """Build v5 distributed config, device_mesh, and moe_mesh from engine config.
+    """Build a v5 ``DistributedSetup`` (with device_mesh / moe_mesh) from engine config.
+
+    Automodel 0.5.0 collapsed the previously-separate distributed kwargs
+    (``distributed_config``, ``moe_mesh``, ``moe_config``, ``activation_checkpointing``)
+    into a single :class:`DistributedSetup` object accepted by
+    ``NeMoAutoModelForCausalLM.from_pretrained(distributed_setup=...)``. This helper
+    builds that object from the verl ``AutomodelEngineConfig`` and also exposes the
+    underlying ``strategy_config`` / meshes for the rest of the engine, which still
+    reads them through the pre-0.5.0 field names.
 
     Args:
         engine_config: AutomodelEngineConfig instance.
         world_size: Total number of processes in the job.
 
     Returns:
-        Tuple of (distributed_config, device_mesh, moe_mesh).
+        Tuple of (distributed_setup, strategy_config, device_mesh, moe_mesh), where
+        ``distributed_setup`` is the :class:`DistributedSetup` to pass to
+        ``from_pretrained``, ``strategy_config`` is the FSDP2Config / MegatronFSDPConfig
+        / DDPConfig (used by ``maybe_fully_shard_optimizer`` and the optimizer builder),
+        and ``device_mesh`` / ``moe_mesh`` are pulled from ``distributed_setup.mesh_context``.
     """
-    from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
-    from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
+    from nemo_automodel.components.distributed.config import (
+        DDPConfig,
+        DistributedSetup,
+        FSDP2Config,
+        MegatronFSDPConfig,
+        MoEParallelizerConfig,
+        _resolve_strategy_config,
+    )
+    from nemo_automodel.components.distributed.mesh import ParallelismSizes
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from verl.utils.torch_dtypes import PrecisionType
 
     strategy = engine_config.distributed_strategy
 
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=PrecisionType.to_dtype(engine_config.mp_param_dtype),
+        reduce_dtype=PrecisionType.to_dtype(engine_config.mp_reduce_dtype),
+        output_dtype=PrecisionType.to_dtype(engine_config.mp_output_dtype),
+        cast_forward_inputs=True,
+    )
+
+    # Build the typed strategy config; verl only supports the subset of strategies
+    # whose constructor accepts the fields below.
     if strategy == "fsdp2":
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-
-        from verl.utils.torch_dtypes import PrecisionType
-
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=PrecisionType.to_dtype(engine_config.mp_param_dtype),
-            reduce_dtype=PrecisionType.to_dtype(engine_config.mp_reduce_dtype),
-            output_dtype=PrecisionType.to_dtype(engine_config.mp_output_dtype),
-            cast_forward_inputs=True,
-        )
-
-        distributed_config = FSDP2Config(
+        strategy_config = FSDP2Config(
             sequence_parallel=engine_config.sequence_parallel,
             mp_policy=mp_policy,
             activation_checkpointing=engine_config.activation_checkpointing,
             defer_fsdp_grad_sync=engine_config.defer_fsdp_grad_sync,
         )
-
     elif strategy == "megatron_fsdp":
-        distributed_config = MegatronFSDPConfig(
+        strategy_config = MegatronFSDPConfig(
             activation_checkpointing=engine_config.activation_checkpointing,
         )
-
     elif strategy == "ddp":
-        distributed_config = DDPConfig(
+        strategy_config = DDPConfig(
             activation_checkpointing=engine_config.activation_checkpointing,
         )
-
     else:
-        raise ValueError(f"Unsupported distributed_strategy: {strategy}")
+        # ``_resolve_strategy_config`` gives a helpful, version-accurate error.
+        strategy_config = _resolve_strategy_config(strategy)
 
-    device_mesh, moe_mesh = create_device_mesh(
-        distributed_config,
+    parallelism = ParallelismSizes(
         tp_size=engine_config.tp_size,
         pp_size=engine_config.pp_size,
         cp_size=engine_config.cp_size,
         ep_size=engine_config.ep_size,
         dp_replicate_size=engine_config.dp_replicate_size,
+    )
+
+    # MoE parallelizer config: fold in the FSDP mp_policy so EP experts share the
+    # same mixed-precision policy (mirrors the pre-0.5.0 ``moe_kwargs`` logic).
+    moe_parallel_config = None
+    if engine_config.ep_size > 1:
+        moe_kwargs = dict(engine_config.moe_config) if engine_config.moe_config else {}
+        moe_kwargs.setdefault("mp_policy", mp_policy)
+        moe_parallel_config = MoEParallelizerConfig(**moe_kwargs)
+
+    distributed_setup = DistributedSetup.build(
+        strategy=strategy_config,
+        parallelism_sizes=parallelism,
+        moe_parallel_config=moe_parallel_config,
+        activation_checkpointing=engine_config.activation_checkpointing,
         world_size=world_size,
     )
 
-    return distributed_config, device_mesh, moe_mesh
+    mesh_context = distributed_setup.mesh_context
+    return distributed_setup, strategy_config, mesh_context.device_mesh, mesh_context.moe_mesh
 
 
-def build_automodel_model(model_config, engine_config, distributed_config, device_mesh, moe_mesh):
+def build_automodel_model(model_config, engine_config, distributed_setup, strategy_config, device_mesh, moe_mesh):
     """Build a model using NeMoAutoModelForCausalLM.from_pretrained().
 
     Args:
         model_config: HFModelConfig with model path and settings.
         engine_config: AutomodelEngineConfig with distributed settings.
-        distributed_config: FSDP2Config, MegatronFSDPConfig, or DDPConfig instance.
+        distributed_setup: Resolved Automodel 0.5.0 ``DistributedSetup`` (topology +
+            policy) passed to ``from_pretrained``. ``strategy_config``, ``device_mesh``
+            and ``moe_mesh`` are the pre-0.5.0 decomposed views kept for callers that
+            still read them directly (grad clipping, checkpointer, mesh helpers).
+        strategy_config: FSDP2Config / MegatronFSDPConfig / DDPConfig.
         device_mesh: Pre-created device mesh (or None for DDP).
         moe_mesh: Pre-created MoE mesh (or None).
 
@@ -165,16 +202,6 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
         backend_kwargs = dict(engine_config.backend_config)
         kwargs["backend"] = BackendConfig(**backend_kwargs)
 
-    # MoE config for MoEParallelizerConfig
-    if engine_config.ep_size > 1:
-        from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-        moe_kwargs = dict(engine_config.moe_config) if engine_config.moe_config else {}
-        if hasattr(distributed_config, "mp_policy"):
-            moe_kwargs.setdefault("mp_policy", distributed_config.mp_policy)
-
-        kwargs["moe_config"] = MoEParallelizerConfig(**moe_kwargs)
-
     kwargs["attn_implementation"] = engine_config.attn_implementation
 
     from verl.utils.torch_dtypes import PrecisionType
@@ -183,10 +210,7 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
 
     model = NeMoAutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=model_config.path,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=distributed_config,
-        activation_checkpointing=engine_config.activation_checkpointing,
+        distributed_setup=distributed_setup,
         trust_remote_code=model_config.trust_remote_code,
         **kwargs,
     )
