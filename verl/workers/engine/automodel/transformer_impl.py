@@ -131,7 +131,7 @@ class AutomodelEngine(BaseEngine):
 
     def initialize(self):
         """Build the model, optimizer, LR scheduler, and checkpointer using Automodel infrastructure."""
-        self.module = build_automodel_model(
+        self.module, self.peft_config = build_automodel_model(
             self.model_config,
             self.engine_config,
             self.distributed_setup,
@@ -170,6 +170,15 @@ class AutomodelEngine(BaseEngine):
         dropped. We honor the same ``optimizer_impl.optimizer`` dotted path verl
         always assembled (e.g. ``transformer_engine.pytorch.optimizers.fused_adam``)
         by passing it as the registry/import-path string.
+
+        NOTE: Automodel's top-level ``build_optimizer(model, (name, kwargs), *,
+        device_mesh=)`` dispatcher does not forward ``is_peft`` to
+        ``OptimizerConfig.build`` when given the tuple path. ``is_peft`` only
+        suppresses a bf16-precision warning; param selection is handled by the
+        automatic freeze in ``apply_model_infrastructure`` (all non-``lora_`` params
+        are frozen when ``peft_config`` is passed to ``from_pretrained``), so only
+        adapter params reach the optimizer regardless. Skipping ``is_peft`` here is
+        safe.
         """
         from nemo_automodel.components.optim.optimizer import build_optimizer as automodel_build_optimizer
 
@@ -369,6 +378,7 @@ class AutomodelEngine(BaseEngine):
             raise ValueError(f"Invalid device type: {device}")
 
     def _build_checkpointer(self):
+        is_peft = self.peft_config is not None
         ckpt_config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir="checkpoints/",
@@ -376,7 +386,7 @@ class AutomodelEngine(BaseEngine):
             model_cache_dir=HF_HUB_CACHE,
             model_repo_id=self.model_config.path,
             save_consolidated=True,
-            is_peft=False,
+            is_peft=is_peft,
         )
         self.checkpointer = Checkpointer(
             config=ckpt_config,
@@ -400,7 +410,7 @@ class AutomodelEngine(BaseEngine):
             load_automodel_model_to_gpu(self.module)
 
         # Save model weights
-        self.checkpointer.save_model(self.module, local_path)
+        self.checkpointer.save_model(self.module, local_path, peft_config=self.peft_config)
 
         # Save optimizer and LR scheduler state
         if self.optimizer is not None:
@@ -418,14 +428,25 @@ class AutomodelEngine(BaseEngine):
         if self._is_offload_param:
             load_automodel_model_to_gpu(self.module)
 
-        model_path = os.path.join(local_path, "model")
-        if not os.path.isdir(model_path):
-            model_path = local_path
-        self.checkpointer.load_model(self.module, model_path)
+        # Resume a pre-trained LoRA adapter from a standalone path. The base weights
+        # were already loaded by the internal checkpointer during initialize(); here we
+        # only restore adapter weights via the recipe-level checkpointer (is_peft=True
+        # reads adapter_model.safetensors).
+        adapter_path = getattr(self.model_config, "lora_adapter_path", None)
+        if adapter_path is not None and self.peft_config is not None:
+            from verl.utils.fs import copy_to_local
 
-        if self.optimizer is not None:
-            scheduler_list = [self.lr_scheduler] if self.lr_scheduler is not None else None
-            self.checkpointer.load_optimizer(self.optimizer, self.module, local_path, scheduler=scheduler_list)
+            local_adapter_path = copy_to_local(adapter_path, use_shm=self.model_config.use_shm)
+            self.checkpointer.load_model(self.module, local_adapter_path)
+        else:
+            model_path = os.path.join(local_path, "model")
+            if not os.path.isdir(model_path):
+                model_path = local_path
+            self.checkpointer.load_model(self.module, model_path)
+
+            if self.optimizer is not None:
+                scheduler_list = [self.lr_scheduler] if self.lr_scheduler is not None else None
+                self.checkpointer.load_optimizer(self.optimizer, self.module, local_path, scheduler=scheduler_list)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -440,6 +461,12 @@ class AutomodelEngine(BaseEngine):
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
+        # When LoRA is enabled, only yield adapter params (mirrors Automodel's
+        # ModelState.state_dict which filters to "lora_" keys). The rollout engine
+        # already holds the frozen base weights, so only adapter deltas are synced.
+        if self.peft_config is not None:
+            params = {k: v for k, v in params.items() if "lora_" in k}
+
         if self._is_offload_param:
             offload_automodel_model_to_cpu(self.module)
 
@@ -448,7 +475,8 @@ class AutomodelEngine(BaseEngine):
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
                 yield name, unsharded_tensor
 
-        return param_generator(), None
+        peft_config_dict = self.peft_config.to_dict() if self.peft_config is not None else None
+        return param_generator(), peft_config_dict
 
 
 class AutomodelEvalModeCtx(BaseEngineCtx):

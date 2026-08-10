@@ -157,6 +157,51 @@ def build_distributed_config_from_engine_config(engine_config, world_size):
     return distributed_setup, strategy_config, mesh_context.device_mesh, mesh_context.moe_mesh
 
 
+def build_peft_config(model_config):
+    """Build an Automodel ``PeftConfig`` from verl's flat LoRA fields, or ``None`` if disabled.
+
+    verl gates LoRA via ``model_config.lora_rank > 0`` (FSDP-style flat fields). This maps
+    those fields to Automodel 0.5.0's :class:`PeftConfig` so that
+    ``NeMoAutoModelForCausalLM.from_pretrained(peft_config=...)`` injects adapters,
+    freezes base weights, and flags the internal checkpointer as PEFT — all automatically.
+
+    A ``PeftConfig`` *instance* (not a dict) is required because Automodel's
+    infrastructure code mutates ``peft_config.use_triton`` and reads ``.dim``/``.alpha``
+    as attributes.
+    """
+    if model_config.lora_rank <= 0:
+        return None
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    target_modules = model_config.target_modules
+    match_all_linear = False
+    # verl uses the "all-linear" string sentinel; Automodel uses match_all_linear=True
+    # with an empty target_modules list.
+    if isinstance(target_modules, str) and target_modules == "all-linear":
+        target_modules = []
+        match_all_linear = True
+    elif target_modules is not None:
+        target_modules = list(target_modules)
+    else:
+        target_modules = []
+
+    # verl stores exclude_modules as Optional[str]; PeftConfig expects a list.
+    exclude_modules = []
+    if model_config.exclude_modules:
+        exclude_modules = [model_config.exclude_modules]
+
+    return PeftConfig(
+        dim=model_config.lora_rank,
+        alpha=model_config.lora_alpha,
+        target_modules=target_modules,
+        exclude_modules=exclude_modules,
+        match_all_linear=match_all_linear,
+        # use Automodel defaults for: use_dora, dropout, dropout_position,
+        # lora_A_init, lora_dtype, use_memory_efficient_lora, use_triton,
+        # moe_rank_scaling
+    )
+
+
 def build_automodel_model(model_config, engine_config, distributed_setup, strategy_config, device_mesh, moe_mesh):
     """Build a model using NeMoAutoModelForCausalLM.from_pretrained().
 
@@ -172,7 +217,9 @@ def build_automodel_model(model_config, engine_config, distributed_setup, strate
         moe_mesh: Pre-created MoE mesh (or None).
 
     Returns:
-        A HuggingFace model with Automodel's distributed infrastructure applied.
+        Tuple of (model, peft_config) where peft_config is an Automodel ``PeftConfig``
+        instance when LoRA is enabled (``model_config.lora_rank > 0``) or ``None``.
+        The caller reuses peft_config for checkpointing and rollout weight sync.
     """
     from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
 
@@ -208,6 +255,12 @@ def build_automodel_model(model_config, engine_config, distributed_setup, strate
 
     kwargs["torch_dtype"] = PrecisionType.to_dtype(engine_config.model_dtype)
 
+    # LoRA: pass an Automodel PeftConfig instance so from_pretrained injects adapters,
+    # freezes base params, and flags the internal base-weight checkpointer as PEFT.
+    peft_config = build_peft_config(model_config)
+    if peft_config is not None:
+        kwargs["peft_config"] = peft_config
+
     model = NeMoAutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=model_config.path,
         distributed_setup=distributed_setup,
@@ -215,7 +268,7 @@ def build_automodel_model(model_config, engine_config, distributed_setup, strate
         **kwargs,
     )
 
-    return model
+    return model, peft_config
 
 
 @torch.no_grad()
