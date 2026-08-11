@@ -74,6 +74,62 @@ except ImportError:
     pass
 
 
+def _patch_lora_moe_expert_mapping_order(model):
+    """Reorder the swapped ``param_name`` segments vLLM's
+    ``fused_moe_make_expert_params_mapping`` produces for LoRA-wrapped MoE.
+
+    The live LoRA tree is ``experts.base_layer.routed_experts.w13_weight`` but the
+    function builds ``experts.routed_experts.base_layer.w13_`` (segments swapped),
+    so strict loaders' ``params_dict[name]`` misses -> ``KeyError``. Only
+    DeepseekV2/DSV3 hit this (their ``load_weights`` is strict + calls the
+    mapping); other MoE loaders use ``AutoWeightsLoader``. Idempotent; non-LoRA
+    mappings pass through.
+    """
+    # Gate to DeepseekV2/DSV3 (the only strict MoE loader that calls the mapping).
+    inner = getattr(model, "model", None) or getattr(model, "language_model", None)
+    if inner is not None and type(inner).__name__ != "DeepseekV2Model":
+        return
+
+    import vllm.model_executor.layers.fused_moe as _fused_moe
+
+    fn = getattr(_fused_moe, "fused_moe_make_expert_params_mapping", None)
+    if fn is None or getattr(fn, "_verl_lora_order_patched", False):
+        return
+
+    _original = fn
+
+    def _wrapped(model, *args, **kwargs):
+        mapping = _original(model, *args, **kwargs)
+        reordered = []
+        for entry in mapping:
+            param_name = entry[0]
+            if "routed_experts.base_layer." in param_name:
+                param_name = param_name.replace("routed_experts.base_layer.", "base_layer.routed_experts.")
+                entry = (param_name,) + tuple(entry[1:])
+            reordered.append(entry)
+        return reordered
+
+    _wrapped._verl_lora_order_patched = True
+    _wrapped._verl_original = _original
+    _fused_moe.fused_moe_make_expert_params_mapping = _wrapped
+
+    # ``deepseek_v2.py`` binds this function by name at import time
+    # (``from ... import fused_moe_make_expert_params_mapping``), so patching only
+    # ``_fused_moe.<fn>`` leaves that binding on the original. Rebind every
+    # module still holding the original.
+    import sys as _sys
+
+    for _mod in list(_sys.modules.values()):
+        if _mod is None:
+            continue
+        try:
+            _bound = getattr(_mod, "fused_moe_make_expert_params_mapping", None)
+        except Exception:
+            continue
+        if _bound is _original:
+            _mod.fused_moe_make_expert_params_mapping = _wrapped
+
+
 def patch_vllm_moe_model_weight_loader(model):
     # this is a work around to load the weight of vllm fused moe model
     # it is from a bug from vllm 0.8.2
@@ -97,7 +153,9 @@ def patch_vllm_moe_model_weight_loader(model):
         return
 
     original_model_type = type(model)
-    if hasattr(model, "runnable") and "ACLGraphWrapper" in str(original_model_type):
+    # Unwrap graph-capture wrappers (ACL/CUDAGraphWrapper) so isinstance sees the
+    # real model; matching just "ACLGraphWrapper" missed CUDAGraphWrapper.
+    if hasattr(model, "runnable") and "GraphWrapper" in str(original_model_type):
         model = model.runnable
         original_model_type = type(model)
 
@@ -136,10 +194,9 @@ def patch_vllm_moe_model_weight_loader(model):
         if not experts:
             continue
 
-        # verl syncs plain HF names, not PEFT checkpoint names, so the LoRA MoE
-        # ``lora_base_layer_prefix`` (folded into a dotted param_name that
-        # getattr can't resolve) must be cleared. Runs before the
-        # ``weight_loader`` guard so LoRA-wrapped MoE (no weight_loader) is covered.
+        # verl syncs plain HF names; clear the LoRA ``lora_base_layer_prefix``
+        # (a dotted param_name getattr can't resolve). Before the weight_loader
+        # guard so LoRA-wrapped MoE (no weight_loader) is covered.
         routed_experts = getattr(getattr(experts, "base_layer", None), "routed_experts", None)
         if routed_experts is not None and getattr(routed_experts, "lora_base_layer_prefix", ""):
             routed_experts.lora_base_layer_prefix = ""
@@ -151,3 +208,7 @@ def patch_vllm_moe_model_weight_loader(model):
         for name, param in mlp.named_parameters():
             if "w13_weight" in name or "w2_weight" in name:
                 param.weight_loader = experts.weight_loader
+
+    # LoRA-wrapped MoE: reorder the swapped ``param_name`` segments (see helper
+    # above). Gated to DeepseekV2/DSV3 inside the helper.
+    _patch_lora_moe_expert_mapping_order(model)

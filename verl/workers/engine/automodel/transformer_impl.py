@@ -47,6 +47,12 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import AutomodelEngineConfig, AutomodelOptimizerConfig, HFModelConfig
+from verl.workers.engine.automodel.utils import (
+    collect_automodel_lora_param_maps,
+    split_moe_lora_adapter,
+    split_packed_expert,
+    to_vllm_peft_dict,
+)
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -162,24 +168,7 @@ class AutomodelEngine(BaseEngine):
         torch.cuda.empty_cache()
 
     def _build_optimizer(self, module):
-        """Build optimizer via Automodel's build_optimizer.
-
-        Automodel 0.5.0 changed ``build_optimizer`` to take a
-        ``(name_or_path, kwargs)`` tuple (or typed ``OptimizerConfig``) and a
-        keyword-only ``device_mesh=``; the ``distributed_config`` positional was
-        dropped. We honor the same ``optimizer_impl.optimizer`` dotted path verl
-        always assembled (e.g. ``transformer_engine.pytorch.optimizers.fused_adam``)
-        by passing it as the registry/import-path string.
-
-        NOTE: Automodel's top-level ``build_optimizer(model, (name, kwargs), *,
-        device_mesh=)`` dispatcher does not forward ``is_peft`` to
-        ``OptimizerConfig.build`` when given the tuple path. ``is_peft`` only
-        suppresses a bf16-precision warning; param selection is handled by the
-        automatic freeze in ``apply_model_infrastructure`` (all non-``lora_`` params
-        are frozen when ``peft_config`` is passed to ``from_pretrained``), so only
-        adapter params reach the optimizer regardless. Skipping ``is_peft`` here is
-        safe.
-        """
+        """Build optimizer via Automodel's build_optimizer."""
         from nemo_automodel.components.optim.optimizer import build_optimizer as automodel_build_optimizer
 
         config = self.optimizer_config
@@ -428,10 +417,8 @@ class AutomodelEngine(BaseEngine):
         if self._is_offload_param:
             load_automodel_model_to_gpu(self.module)
 
-        # Resume a pre-trained LoRA adapter from a standalone path. The base weights
-        # were already loaded by the internal checkpointer during initialize(); here we
-        # only restore adapter weights via the recipe-level checkpointer (is_peft=True
-        # reads adapter_model.safetensors).
+        # Resume a pre-trained LoRA adapter from a standalone path (base weights
+        # were already loaded at initialize(); is_peft=True reads adapter_model.safetensors).
         adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         if adapter_path is not None and self.peft_config is not None:
             from verl.utils.fs import copy_to_local
@@ -455,27 +442,66 @@ class AutomodelEngine(BaseEngine):
         if self._is_offload_optimizer and self.optimizer is not None:
             offload_automodel_optimizer(self.optimizer)
 
-    def get_per_tensor_param(self, **kwargs):
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         load_automodel_model_to_gpu(self.module)
 
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
-        # When LoRA is enabled, only yield adapter params (mirrors Automodel's
-        # ModelState.state_dict which filters to "lora_" keys). The rollout engine
-        # already holds the frozen base weights, so only adapter deltas are synced.
+        # Drop parametrization metadata (e.g. Moonlight MLA ``*_extra_state``) — no
+        # matching vLLM param, would KeyError during weight sync.
+        params = {k: v for k, v in params.items() if "_extra_state" not in k}
+
+        # LoRA sync is two-phase: base_sync_done=False streams the whole base model
+        # (load_format=dummy), base_sync_done=True yields adapter-only params +
+        # peft_config for vLLM add_lora. Full-FT (peft_config is None) yields all.
         if self.peft_config is not None:
-            params = {k: v for k, v in params.items() if "lora_" in k}
+            if base_sync_done:
+                params = {k: v for k, v in params.items() if "lora_" in k}
+            else:
+                params = {k: v for k, v in params.items() if "lora_" not in k}
 
         if self._is_offload_param:
             offload_automodel_model_to_cpu(self.module)
 
+        # One tree walk -> packed base expert specs (phase-1 split), MoE LoRA specs
+        # (phase-2 split), patched-linear prefixes (phase-1 _remap).
+        packed_expert_prefixes, moe_lora_prefixes, lora_linear_prefixes = collect_automodel_lora_param_maps(self.module)
+
         def param_generator():
+            lora_base_sync = self.peft_config is not None and not base_sync_done
+
+            def _remap(key):
+                if not lora_base_sync:
+                    return key
+                # Insert .base_layer for patched-linear keys (vLLM's LoRA namespace);
+                # skip lm_head/embed (ParallelLMHead/VocabParallelEmbedding, not wrapped).
+                if key.endswith("lm_head.weight") or key.endswith("embed_tokens.weight"):
+                    return key
+                for prefix in lora_linear_prefixes:
+                    if key.startswith(prefix + "."):
+                        return f"{prefix}.base_layer.{key[len(prefix) + 1 :]}"
+                return key
+
             for name, param in params.items():
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
-                yield name, unsharded_tensor
+                # Phase 2: split MoE adapter params into per-expert lora_A/lora_B.
+                moe_lora_spec = moe_lora_prefixes.get(name)
+                if moe_lora_spec is not None and unsharded_tensor.dim() == 3:
+                    yield from split_moe_lora_adapter(moe_lora_spec, name.rsplit(".", 1)[-1], unsharded_tensor)
+                    continue
+                # Phase 1: split packed MoE base tensors into per-expert keys.
+                spec = packed_expert_prefixes.get(name)
+                if spec is not None and unsharded_tensor.dim() == 3:
+                    for expert_id in range(unsharded_tensor.size(0)):
+                        for sub_name, sub_tensor in split_packed_expert(spec, unsharded_tensor, expert_id):
+                            yield _remap(f"{spec.prefix}.{expert_id}.{sub_name}"), sub_tensor
+                    continue
+                yield _remap(name), unsharded_tensor
 
-        peft_config_dict = self.peft_config.to_dict() if self.peft_config is not None else None
+        # Return peft_config for both LoRA phases (mirrors FSDP): phase 1 uses it as
+        # the "LoRA-wrapped, resolve names" signal; add_lora fires in phase 2.
+        peft_config_dict = to_vllm_peft_dict(self.peft_config) if self.peft_config is not None else None
         return param_generator(), peft_config_dict
 
 

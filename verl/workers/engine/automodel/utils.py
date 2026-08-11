@@ -14,6 +14,8 @@
 
 """Utility functions for the Automodel engine integration."""
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed
 
@@ -325,3 +327,163 @@ def load_automodel_optimizer(optimizer, device_id):
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to(device_id, non_blocking=True)
+
+
+# Automodel <-> vLLM weight sync: split packed 3D MoE params into the per-expert
+# 2D keys vLLM expects. See transformer_impl.get_per_tensor_param for dispatch.
+
+
+def _norm_ac_ckpt(name):
+    """Strip ``._checkpoint_wrapped_module.`` so module names match state_dict keys."""
+    return name.replace("._checkpoint_wrapped_module.", ".")
+
+
+def collect_automodel_lora_param_maps(model):
+    """One module-tree walk -> (packed_expert_prefixes, moe_lora_prefixes,
+    lora_linear_prefixes) for the weight-sync generator. Each is empty when the
+    relevant types are absent or nemo_automodel is missing.
+    """
+    packed_expert_prefixes = {}
+    moe_lora_prefixes = {}
+    lora_linear_prefixes = set()
+
+    try:
+        from nemo_automodel.components.moe.experts import (
+            GroupedExperts,
+            GroupedExpertsDeepEP,
+            GroupedExpertsTE,
+        )
+
+        expert_types = (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)
+    except ImportError:
+        expert_types = ()
+    try:
+        from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+
+        lora_expert_types = (GroupedExpertsLoRA,)
+    except ImportError:
+        lora_expert_types = ()
+    try:
+        from nemo_automodel.components._peft.lora import LinearLoRA
+
+        lora_linear_types = (LinearLoRA,)
+    except ImportError:
+        lora_linear_types = ()
+
+    # Order matters: GroupedExpertsLoRA subclasses GroupedExperts, so check the
+    # LoRA variant first; otherwise it'd be caught by the base-expert branch.
+    for name, module in model.named_modules():
+        if lora_expert_types and isinstance(module, lora_expert_types):
+            name = _norm_ac_ckpt(name)
+            cfg = module.config
+            spec = _MoELoRASpec(
+                prefix=name,
+                moe_inter_dim=cfg.moe_inter_dim,
+                is_gated=bool(getattr(module, "is_gated", True)),
+            )
+            for attr in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+                moe_lora_prefixes[f"{name}.{attr}"] = spec
+            continue
+        if expert_types and isinstance(module, expert_types):
+            name = _norm_ac_ckpt(name)
+            if hasattr(module, "gate_and_up_projs"):
+                packed_expert_prefixes[f"{name}.gate_and_up_projs"] = _PackedExpertSpec(
+                    prefix=name,
+                    packed_attr="gate_and_up_projs",
+                    splits=(("gate_proj", "up_proj"),),
+                )
+            if hasattr(module, "down_projs"):
+                packed_expert_prefixes[f"{name}.down_projs"] = _PackedExpertSpec(
+                    prefix=name,
+                    packed_attr="down_projs",
+                    splits=(("down_proj",),),
+                )
+            continue
+        if lora_linear_types and isinstance(module, lora_linear_types):
+            lora_linear_prefixes.add(_norm_ac_ckpt(name))
+
+    return packed_expert_prefixes, moe_lora_prefixes, lora_linear_prefixes
+
+
+@dataclass
+class _PackedExpertSpec:
+    """One packed MoE base param and its split rule."""
+
+    prefix: str
+    packed_attr: str
+    splits: tuple
+
+
+def split_packed_expert(spec, packed_tensor, expert_id):
+    """Yield ``(sub_name, 2D_tensor)`` for one expert from a packed 3D base param
+    (``[n_experts, in, out]``), transposed to ``[out, in]``. Fused gate+up is
+    chunked gate-then-up along the last dim.
+    """
+    per_expert = packed_tensor[expert_id]  # [in, out]
+    for sub_names in spec.splits:
+        if len(sub_names) == 1:
+            yield sub_names[0] + ".weight", per_expert.t().contiguous()
+        else:
+            for sub_name, chunk in zip(sub_names, per_expert.chunk(len(sub_names), dim=-1), strict=False):
+                yield sub_name + ".weight", chunk.t().contiguous()
+
+
+@dataclass
+class _MoELoRASpec:
+    """Per-expert lora_A/lora_B split params for one GroupedExpertsLoRA module."""
+
+    prefix: str
+    moe_inter_dim: int
+    is_gated: bool
+
+
+def split_moe_lora_adapter(spec, attr, packed_tensor):
+    """Yield ``(vllm_key, 2D_tensor)`` per expert from one fused 3D adapter param.
+    ``attr`` is ``lora_gate_and_up_A/B`` (w1+w3) or ``lora_down_A/B`` (w2); A is
+    ``[in, rank]``, B is ``[rank, out]``. Non-gated MoE skips up_proj (w3).
+    """
+    n_experts = packed_tensor.size(0)
+    moe_inter_dim = spec.moe_inter_dim
+    is_gated = spec.is_gated
+
+    if attr == "lora_gate_and_up_A":
+        # [n, expert_dim, lora_dim] -> w1 A and w3 A (shared input).
+        for i in range(n_experts):
+            a = packed_tensor[i].contiguous()
+            yield f"{spec.prefix}.{i}.gate_proj.lora_A.weight", a
+            if is_gated:
+                yield f"{spec.prefix}.{i}.up_proj.lora_A.weight", a.clone()
+    elif attr == "lora_gate_and_up_B":
+        # [n, lora_dim, 2*moe_inter_dim] -> split last dim: w1 B | w3 B.
+        for i in range(n_experts):
+            b = packed_tensor[i]
+            yield f"{spec.prefix}.{i}.gate_proj.lora_B.weight", b[..., :moe_inter_dim].contiguous()
+            if is_gated:
+                yield f"{spec.prefix}.{i}.up_proj.lora_B.weight", b[..., moe_inter_dim:].contiguous()
+    elif attr == "lora_down_A":
+        for i in range(n_experts):
+            yield f"{spec.prefix}.{i}.down_proj.lora_A.weight", packed_tensor[i].contiguous()
+    elif attr == "lora_down_B":
+        for i in range(n_experts):
+            yield f"{spec.prefix}.{i}.down_proj.lora_B.weight", packed_tensor[i].contiguous()
+    else:
+        raise ValueError(f"Unknown MoE LoRA adapter attr: {attr!r}")
+
+
+def to_vllm_peft_dict(peft_config):
+    """Translate an Automodel ``PeftConfig`` to the HF/peft dict vLLM's
+    ``PEFTHelper.from_dict`` expects (``r``/``lora_alpha``/``target_modules``).
+    ``match_all_linear`` -> ``target_modules=None`` (vLLM treats ``None`` as
+    "all"; ``[]`` means "nothing").
+    """
+    d = peft_config.to_dict()
+    target_modules = d.get("target_modules") or []
+    target_modules = None if d.get("match_all_linear") else list(target_modules)
+    return {
+        "r": d["dim"],
+        "lora_alpha": d["alpha"],
+        "target_modules": target_modules,
+        "use_rslora": False,
+        "use_dora": bool(d.get("use_dora", False)),
+        "bias": "none",
+    }
