@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed
+from torch.distributed.tensor import DTensor
 
 from verl.utils.device import get_device_id, get_torch_device
 
@@ -340,19 +341,20 @@ def _norm_ac_ckpt(name):
 
 def collect_automodel_lora_param_maps(model):
     """One module-tree walk -> (packed_expert_prefixes, moe_lora_prefixes,
-    lora_linear_prefixes) for the weight-sync generator. Each is empty when the
-    relevant types are absent or nemo_automodel is missing.
+    lora_linear_prefixes, moe_lora_modules, dense_lora_modules) for the
+    weight-sync generator. The first three (specs / prefix sets) drive the
+    non-merge two-phase split; the last two (prefix -> module) drive the
+    merge path. Each is empty when the relevant types are absent or
+    nemo_automodel is missing.
     """
     packed_expert_prefixes = {}
     moe_lora_prefixes = {}
     lora_linear_prefixes = set()
+    moe_lora_modules = {}
+    dense_lora_modules = {}
 
     try:
-        from nemo_automodel.components.moe.experts import (
-            GroupedExperts,
-            GroupedExpertsDeepEP,
-            GroupedExpertsTE,
-        )
+        from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 
         expert_types = (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)
     except ImportError:
@@ -383,6 +385,7 @@ def collect_automodel_lora_param_maps(model):
             )
             for attr in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
                 moe_lora_prefixes[f"{name}.{attr}"] = spec
+            moe_lora_modules[name] = module
             continue
         if expert_types and isinstance(module, expert_types):
             name = _norm_ac_ckpt(name)
@@ -400,9 +403,11 @@ def collect_automodel_lora_param_maps(model):
                 )
             continue
         if lora_linear_types and isinstance(module, lora_linear_types):
-            lora_linear_prefixes.add(_norm_ac_ckpt(name))
+            n = _norm_ac_ckpt(name)
+            lora_linear_prefixes.add(n)
+            dense_lora_modules[n] = module
 
-    return packed_expert_prefixes, moe_lora_prefixes, lora_linear_prefixes
+    return packed_expert_prefixes, moe_lora_prefixes, lora_linear_prefixes, moe_lora_modules, dense_lora_modules
 
 
 @dataclass
@@ -487,3 +492,51 @@ def to_vllm_peft_dict(peft_config):
         "use_dora": bool(d.get("use_dora", False)),
         "bias": "none",
     }
+
+
+# --- LoRA merge (model.lora.merge=true): fold adapters into base weights -----
+# On-the-fly (no in-place mutation / backup-restore): the weight-sync generator
+# calls these at yield time and ``.full_tensor()`` already copies, so yielded
+# tensors never alias module storage.
+
+
+def _full(t):
+    """Unshard a DTensor to a plain tensor; pass through plain tensors."""
+    return t.full_tensor() if isinstance(t, DTensor) else t
+
+
+def merged_dense_lora_weight(module):
+    """Merged weight ``base + scale*(lora_B @ lora_A)`` for a ``LinearLoRA``.
+
+    Prefers the layer's ``materialize_effective_weight``; falls back to manual
+    math when it raises (DoRA / quantized / delegated — not hit on TE backends).
+    """
+    try:
+        return module.materialize_effective_weight().detach()
+    except NotImplementedError:
+        w = _full(module.weight)
+        a = _full(module.lora_A.weight)
+        b = _full(module.lora_B.weight)
+        return (w + module.scale * (b @ a)).detach()
+
+
+def merged_packed_expert_base(module, attr):
+    """Merged 3D base for a ``GroupedExpertsLoRA`` module.
+
+    ``attr`` is ``"gate_and_up_projs"`` or ``"down_projs"``. Returns the full
+    ``[n_experts, ...]`` base tensor with the scaled ``(A @ B)`` delta folded
+    per expert (no in-place mutation). MoE forward is ``x @ A[i] @ B[i]`` =
+    ``x @ (A@B)``; base is stored untransposed ``[in, out]``, so the delta is
+    ``A @ B`` (``[n,in,rank] @ [n,rank,out] -> [n,in,out]``) — NOT ``B @ A``.
+    """
+    if attr == "gate_and_up_projs":
+        a = _full(module.lora_gate_and_up_A)
+        b = _full(module.lora_gate_and_up_B)
+    elif attr == "down_projs":
+        a = _full(module.lora_down_A)
+        b = _full(module.lora_down_B)
+    else:
+        raise ValueError(f"Unknown packed expert base attr: {attr!r}")
+    base = _full(getattr(module, attr))
+    scale = module.scale
+    return (base + scale * torch.bmm(a, b)).detach()

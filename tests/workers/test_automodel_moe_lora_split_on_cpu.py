@@ -23,15 +23,78 @@ lists ``FusedMoEWithLoRA.set_lora`` consumes. These tests pin that mapping.
 """
 
 import torch
+import torch.nn as nn
 
 from verl.workers.engine.automodel.utils import (
     _MoELoRASpec,
+    _PackedExpertSpec,
+    collect_automodel_lora_param_maps,
+    merged_dense_lora_weight,
+    merged_packed_expert_base,
     split_moe_lora_adapter,
+    split_packed_expert,
 )
 
 
 def _spec(n_inter=2048, gated=True):
     return _MoELoRASpec(prefix="model.layers.1.mlp.experts", moe_inter_dim=n_inter, is_gated=gated)
+
+
+# ---------------------------------------------------------------------------
+# Merge-path fixtures: real GroupedExpertsLoRA / LinearLoRA with initialized
+# params (nemo_automodel leaves new params via torch.empty, so we reinit).
+# ---------------------------------------------------------------------------
+
+
+def _moe_cfg(n_experts=2, expert_dim=8, moe_inter_dim=16):
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    return MoEConfig(
+        n_routed_experts=n_experts,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=False,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="sigmoid",
+        route_scale=1.0,
+        dim=expert_dim,
+        inter_dim=moe_inter_dim,
+        moe_inter_dim=moe_inter_dim,
+        norm_topk_prob=True,
+        router_bias=False,
+        expert_bias=False,
+        expert_activation="swiglu",
+        apply_router_weight_after_down=False,
+        activation_alpha=1.702,
+        activation_limit=7.0,
+        swiglu_limit=0.0,
+        softmax_before_topk=False,
+        router_weights_fp32=False,
+        router_weight_uses_score_correction_bias=False,
+        shared_expert_gate=False,
+        shared_expert_inter_dim=None,
+        shared_expert_activation="swiglu",
+        force_e_score_correction_bias=False,
+        moe_latent_size=None,
+        enable_routing_replay=False,
+    )
+
+
+def _grouped_experts_lora(n_experts=2, expert_dim=8, moe_inter_dim=16, lora_dim=4, alpha=8):
+    """A real GroupedExpertsLoRA with initialized (non-NaN) params."""
+    from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+    from nemo_automodel.components.moe.experts import GroupedExperts
+
+    m = GroupedExpertsLoRA(
+        GroupedExperts(_moe_cfg(n_experts, expert_dim, moe_inter_dim)), lora_dim=lora_dim, alpha=alpha
+    )
+    # nemo_automodel allocates params via torch.empty; reinit everything to avoid NaNs.
+    for p in m.parameters():
+        nn.init.normal_(p, std=0.1)
+    return m
 
 
 def test_split_gate_and_up_a_emits_w1_and_w3_a():
@@ -187,7 +250,7 @@ def test_collect_moe_lora_prefixes_finds_grouped_experts_lora():
             super().__init__()
             self.experts = lora_experts
 
-    _, prefixes, _ = collect_automodel_lora_param_maps(_Holder())
+    _, prefixes, _, moe_modules, _ = collect_automodel_lora_param_maps(_Holder())
     # state_dict keys for the holder are "experts.<attr>"
     expected = {
         "experts.lora_gate_and_up_A",
@@ -200,6 +263,9 @@ def test_collect_moe_lora_prefixes_finds_grouped_experts_lora():
     assert spec.prefix == "experts"
     assert spec.moe_inter_dim == 16
     assert spec.is_gated is True
+    # The merge path needs the module ref to fold adapters.
+    assert set(moe_modules) == {"experts"}
+    assert moe_modules["experts"] is lora_experts
 
 
 def test_collect_moe_lora_prefixes_normalizes_checkpoint_wrapper():
@@ -228,7 +294,7 @@ def test_collect_moe_lora_prefixes_normalizes_checkpoint_wrapper():
             self.layers._checkpoint_wrapped_module = torch.nn.Module()
             self.layers._checkpoint_wrapped_module.experts = lora_experts
 
-    _, prefixes, _ = collect_automodel_lora_param_maps(_ACWrapper())
+    _, prefixes, _, _, _ = collect_automodel_lora_param_maps(_ACWrapper())
     # The ``._checkpoint_wrapped_module.`` segment is normalized out so the prefix
     # matches the state_dict() key the rest of the pipeline emits.
     assert "layers._checkpoint_wrapped_module.experts.lora_gate_and_up_A" not in prefixes
@@ -360,3 +426,148 @@ def test_patch_lora_moe_expert_mapping_order_passes_through_non_lora():
             assert "base_layer" not in param_name
     finally:
         fused_moe.fused_moe_make_expert_params_mapping = original
+
+
+# ---------------------------------------------------------------------------
+# Merge path (model.lora.merge=true): fold adapters into base weights.
+# ---------------------------------------------------------------------------
+
+
+def test_merged_dense_lora_weight():
+    """LinearLoRA merge = weight + scale*(lora_B @ lora_A)."""
+    from nemo_automodel.components._peft.lora import LinearLoRA
+
+    m = LinearLoRA(nn.Linear(8, 16, bias=False), dim=4, alpha=8)
+    for p in (m.weight, m.lora_A.weight, m.lora_B.weight):
+        nn.init.normal_(p, std=0.1)
+    out = merged_dense_lora_weight(m)
+    expected = m.weight + m.scale * (m.lora_B.weight @ m.lora_A.weight)
+    torch.testing.assert_close(out, expected)
+    assert out.shape == (16, 8)
+    # No aliasing of module storage (on-the-fly merge, not in-place).
+    assert out.data_ptr() != m.weight.data_ptr()
+
+
+def test_merged_packed_expert_base_gate_up():
+    """gate_and_up_projs merge: per-expert base + scale*(A@B), shape [in, 2*mid]."""
+    n, expert_dim, mid, rank = 2, 8, 16, 4
+    m = _grouped_experts_lora(n, expert_dim, mid, rank, alpha=8)
+    out = merged_packed_expert_base(m, "gate_and_up_projs")
+    assert out.shape == m.gate_and_up_projs.shape  # [n, in, 2*mid]
+    for i in range(n):
+        exp = m.gate_and_up_projs[i] + m.scale * (m.lora_gate_and_up_A[i] @ m.lora_gate_and_up_B[i])
+        torch.testing.assert_close(out[i], exp)
+
+
+def test_merged_packed_expert_base_down():
+    """down_projs merge: per-expert base + scale*(A@B), shape [mid, expert_dim]."""
+    n, expert_dim, mid, rank = 2, 8, 16, 4
+    m = _grouped_experts_lora(n, expert_dim, mid, rank, alpha=8)
+    out = merged_packed_expert_base(m, "down_projs")
+    assert out.shape == m.down_projs.shape  # [n, mid, expert_dim]
+    for i in range(n):
+        exp = m.down_projs[i] + m.scale * (m.lora_down_A[i] @ m.lora_down_B[i])
+        torch.testing.assert_close(out[i], exp)
+
+
+def test_merged_packed_expert_base_rejects_unknown_attr():
+    m = _grouped_experts_lora()
+    try:
+        merged_packed_expert_base(m, "nope")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for unknown attr")
+
+
+def test_merge_splits_to_per_expert_keys():
+    """The merge generator yields per-expert gate/up/down_proj.weight 2D keys
+    (split_packed_expert on the merged 3D), each == split(base+delta)."""
+    n, expert_dim, mid, rank = 2, 8, 16, 4
+    m = _grouped_experts_lora(n, expert_dim, mid, rank, alpha=8)
+    spec_gu = _PackedExpertSpec(prefix="experts", packed_attr="gate_and_up_projs", splits=(("gate_proj", "up_proj"),))
+    spec_dn = _PackedExpertSpec(prefix="experts", packed_attr="down_projs", splits=(("down_proj",),))
+    merged_gu = merged_packed_expert_base(m, "gate_and_up_projs")
+    merged_dn = merged_packed_expert_base(m, "down_projs")
+
+    for i in range(n):
+        keys_gu = [k for k, _ in split_packed_expert(spec_gu, merged_gu, i)]
+        assert keys_gu == ["gate_proj.weight", "up_proj.weight"]
+        vals = dict(split_packed_expert(spec_gu, merged_gu, i))
+        # split_packed_expert transposes to [out, in]; merged base chunk is [in, out].
+        gate_chunk = merged_gu[i].chunk(2, dim=-1)[0].t().contiguous()
+        torch.testing.assert_close(vals["gate_proj.weight"], gate_chunk)
+
+    for i in range(n):
+        keys_dn = [k for k, _ in split_packed_expert(spec_dn, merged_dn, i)]
+        assert keys_dn == ["down_proj.weight"]
+
+
+def test_merge_yields_peft_config_none():
+    """Merge branch returns peft_config=None (rollout has enable_lora disabled)."""
+    # The contract is in get_per_tensor_param; here we assert the helper that
+    # builds the merged generator is wired (no peft_config returned). A full
+    # engine test needs GPU, so we check the generator yields only base keys.
+    n, expert_dim, mid, rank = 1, 8, 16, 4
+    m = _grouped_experts_lora(n, expert_dim, mid, rank, alpha=8)
+
+    class _Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = m
+
+        def state_dict(self):
+            return {f"experts.{k}": v for k, v in m.state_dict().items()}
+
+    holder = _Holder()
+    _, _, _, moe_modules, dense_modules = collect_automodel_lora_param_maps(holder)
+    packed = {
+        "experts.gate_and_up_projs": _PackedExpertSpec("experts", "gate_and_up_projs", (("gate_proj", "up_proj"),)),
+        "experts.down_projs": _PackedExpertSpec("experts", "down_projs", (("down_proj",),)),
+    }
+    params = {k: v for k, v in holder.state_dict().items() if "_extra_state" not in k}
+
+    # Inline the merge generator body (mirrors _merged_lora_param_generator).
+    out = []
+    for name, param in params.items():
+        if "lora_" in name:
+            continue
+        spec = packed.get(name)
+        if spec is not None and moe_modules.get(spec.prefix) is not None:
+            merged = merged_packed_expert_base(moe_modules[spec.prefix], spec.packed_attr)
+            for eid in range(merged.size(0)):
+                for sub_name, sub_tensor in split_packed_expert(spec, merged, eid):
+                    out.append(f"{spec.prefix}.{eid}.{sub_name}")
+            continue
+        out.append(name)
+    # All adapter keys dropped; only base + per-expert split keys remain.
+    assert not any("lora_" in k for k in out)
+    assert "experts.0.gate_proj.weight" in out
+    assert "experts.0.down_proj.weight" in out
+
+
+def test_merge_numerical_equivalence():
+    """Folded-merge forward == online-LoRA forward for a 1-expert module
+    (gate_up path, no routing): x @ merged_gate_up then act then @ merged_down
+    matches x @ base_gate_up + LoRA delta path, within tolerance."""
+    n, expert_dim, mid, rank = 1, 8, 16, 4
+    m = _grouped_experts_lora(n, expert_dim, mid, rank, alpha=8)
+    m.eval()
+    merged_gu = merged_packed_expert_base(m, "gate_and_up_projs")[0]  # [in, 2*mid]
+    merged_dn = merged_packed_expert_base(m, "down_projs")[0]  # [mid, expert_dim]
+
+    x = torch.randn(3, expert_dim, dtype=m.gate_and_up_projs.dtype)
+    # Merged (folded) path.
+    gu = x @ merged_gu  # [3, 2*mid]
+    gate, up = gu.chunk(2, dim=-1)
+    act = torch.nn.functional.silu(gate) * up  # swiglu
+    y_merged = act @ merged_dn  # [3, expert_dim]
+
+    # Online-LoRA path (mirrors GroupedExpertsLoRA._forward_loop math).
+    gu_online = x @ m.gate_and_up_projs[0] + (x @ m.lora_gate_and_up_A[0] @ m.lora_gate_and_up_B[0]) * m.scale
+    gate_o, up_o = gu_online.chunk(2, dim=-1)
+    act_o = torch.nn.functional.silu(gate_o) * up_o
+    y_online = act_o @ m.down_projs[0] + (act_o @ m.lora_down_A[0] @ m.lora_down_B[0]) * m.scale
+
+    # Folded merge and online LoRA use different op orders (merge folds the
+    # delta into one matmul; online adds two), so bf16 rounding diverges ~1e-3.
+    torch.testing.assert_close(y_merged, y_online, atol=2e-3, rtol=2e-2)

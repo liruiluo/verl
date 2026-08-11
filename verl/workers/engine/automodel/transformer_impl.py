@@ -48,7 +48,10 @@ from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import AutomodelEngineConfig, AutomodelOptimizerConfig, HFModelConfig
 from verl.workers.engine.automodel.utils import (
+    _PackedExpertSpec,
     collect_automodel_lora_param_maps,
+    merged_dense_lora_weight,
+    merged_packed_expert_base,
     split_moe_lora_adapter,
     split_packed_expert,
     to_vllm_peft_dict,
@@ -452,10 +455,12 @@ class AutomodelEngine(BaseEngine):
         # matching vLLM param, would KeyError during weight sync.
         params = {k: v for k, v in params.items() if "_extra_state" not in k}
 
-        # LoRA sync is two-phase: base_sync_done=False streams the whole base model
-        # (load_format=dummy), base_sync_done=True yields adapter-only params +
-        # peft_config for vLLM add_lora. Full-FT (peft_config is None) yields all.
-        if self.peft_config is not None:
+        merge_lora = self.peft_config is not None and self.model_config.lora.get("merge", False)
+
+        if self.peft_config is not None and not merge_lora:
+            # Two-phase adapter sync: base_sync_done=False streams the whole base
+            # model (load_format=dummy), base_sync_done=True yields adapter-only
+            # params + peft_config for vLLM add_lora.
             if base_sync_done:
                 params = {k: v for k, v in params.items() if "lora_" in k}
             else:
@@ -465,8 +470,20 @@ class AutomodelEngine(BaseEngine):
             offload_automodel_model_to_cpu(self.module)
 
         # One tree walk -> packed base expert specs (phase-1 split), MoE LoRA specs
-        # (phase-2 split), patched-linear prefixes (phase-1 _remap).
-        packed_expert_prefixes, moe_lora_prefixes, lora_linear_prefixes = collect_automodel_lora_param_maps(self.module)
+        # (phase-2 split), patched-linear prefixes (phase-1 _remap), and module
+        # refs for the merge path.
+        (
+            packed_expert_prefixes,
+            moe_lora_prefixes,
+            lora_linear_prefixes,
+            moe_lora_modules,
+            dense_lora_modules,
+        ) = collect_automodel_lora_param_maps(self.module)
+
+        if merge_lora:
+            return self._merged_lora_param_generator(
+                params, moe_lora_modules, dense_lora_modules, packed_expert_prefixes
+            ), None
 
         def param_generator():
             lora_base_sync = self.peft_config is not None and not base_sync_done
@@ -503,6 +520,49 @@ class AutomodelEngine(BaseEngine):
         # the "LoRA-wrapped, resolve names" signal; add_lora fires in phase 2.
         peft_config_dict = to_vllm_peft_dict(self.peft_config) if self.peft_config is not None else None
         return param_generator(), peft_config_dict
+
+    def _merged_lora_param_generator(self, params, moe_lora_modules, dense_lora_modules, packed_expert_prefixes):
+        """Stream full HF-keyed base params with LoRA adapters folded in
+        (``model.lora.merge=true``). Returns ``peft_config=None`` — the rollout
+        has ``enable_lora`` disabled and expects a standard weight update."""
+        # Split rules for the two packed base attrs of a GroupedExpertsLoRA module.
+        # (collect_automodel_lora_param_maps routes LoRA experts to moe_lora_modules,
+        # NOT packed_expert_prefixes, so build the split specs inline here.)
+        _MERGE_SPLITS = {
+            "gate_and_up_projs": (("gate_proj", "up_proj"),),
+            "down_projs": (("down_proj",),),
+        }
+
+        for name, param in params.items():
+            if "lora_" in name:
+                continue  # adapters are folded into the base below; skip standalone.
+            # Dense LinearLoRA base weight: fold base + scale*(B@A).
+            base_leaf = name.rsplit(".", 1)[-1]
+            prefix = name[: -len(base_leaf) - 1] if "." in name else ""
+            if base_leaf == "weight" and prefix in dense_lora_modules:
+                yield name, merged_dense_lora_weight(dense_lora_modules[prefix])
+                continue
+            # Packed MoE expert base: LoRA-expert modules aren't in
+            # packed_expert_prefixes, so detect via the attr leaf + moe_lora_modules.
+            if base_leaf in _MERGE_SPLITS and prefix in moe_lora_modules:
+                module = moe_lora_modules[prefix]
+                merged = merged_packed_expert_base(module, base_leaf)
+                spec = _PackedExpertSpec(prefix=prefix, packed_attr=base_leaf, splits=_MERGE_SPLITS[base_leaf])
+                for expert_id in range(merged.size(0)):
+                    for sub_name, sub_tensor in split_packed_expert(spec, merged, expert_id):
+                        yield f"{prefix}.{expert_id}.{sub_name}", sub_tensor
+                continue
+            # Non-LoRA base param (embeddings, lm_head, router, shared experts, norms):
+            # plain non-LoRA GroupedExperts still go through packed_expert_prefixes.
+            spec = packed_expert_prefixes.get(name)
+            if spec is not None:
+                unsharded = param.full_tensor() if isinstance(param, DTensor) else param
+                for expert_id in range(unsharded.size(0)):
+                    for sub_name, sub_tensor in split_packed_expert(spec, unsharded, expert_id):
+                        yield f"{spec.prefix}.{expert_id}.{sub_name}", sub_tensor
+                continue
+            unsharded = param.full_tensor() if isinstance(param, DTensor) else param
+            yield name, unsharded
 
 
 class AutomodelEvalModeCtx(BaseEngineCtx):
