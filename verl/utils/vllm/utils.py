@@ -78,7 +78,10 @@ class VLLMHijack:
                 model = self._adapter_manager.model
                 hf_to_vllm_mapper = None
                 if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
-                    hf_to_vllm_mapper = model.hf_to_vllm_mapper
+                    # Drop fusion (orig_to_new_stacked) maps so constituent names
+                    # (e.g. q_proj) survive for the LoRA manager to pack into the
+                    # fused module. Mirrors vLLM's worker_manager._load_adapter.
+                    hf_to_vllm_mapper = model.hf_to_vllm_mapper.get_unstacked_mapper()
 
                 lora_request_kwargs = {
                     "peft_helper": peft_helper,
@@ -128,10 +131,11 @@ def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3"):
     return vs.parse(get_version(pkg)) >= vs.parse(minver)
 
 
-# Whether the installed vLLM ships ``BaseLayerWithLoRA.load_weights`` (newer
-# vLLM: delegates to ``AutoWeightsLoader(base_layer)`` and expects inner names
-# without ``.base_layer.``; released vLLM: the model's ``load_weights`` recurses
-# into the ``base_layer`` child and matches the suffixed name).
+# Whether the installed vLLM ships ``BaseLayerWithLoRA.load_weights`` (landed in
+# #39935 / ``b50fdebce0``). On newer vLLM the LoRA layer's ``load_weights``
+# delegates to ``AutoWeightsLoader(base_layer)`` and expects inner names without
+# ``.base_layer.``; on released vLLM (False) the model's ``load_weights``
+# recurses into the ``base_layer`` child and matches the suffixed name.
 _HAS_LORA_LOAD_WEIGHTS = False
 
 try:
@@ -142,13 +146,59 @@ except ImportError:
     pass
 
 
+# Per-class cache: whether the inner transformer's load_weights is *strict*
+# (params_dict[name] lookup — DeepseekV2, keeps .base_layer.) vs *flat*
+# (AutoWeightsLoader recursion — Llama/Qwen3.5, strips .base_layer.).
+_inner_load_weights_is_strict_cache: dict = {}
+
+
+def _inner_load_weights_is_strict(model) -> bool:
+    """Probe whether the inner transformer uses a *strict* weight loader.
+
+    Strict loaders (DeepseekV2) do ``params_dict[name]`` lookup, so incoming names
+    must carry the live ``.base_layer.`` suffix. Flat loaders (Llama/Qwen3.5)
+    delegate to ``AutoWeightsLoader`` which recurses into ``base_layer`` and want
+    the suffix stripped. Introspected from the loader source (not a model_type
+    allowlist) so new architectures auto-adapt; cached per class.
+    """
+    import inspect
+
+    cls = type(model)
+    cached = _inner_load_weights_is_strict_cache.get(cls)
+    if cached is not None:
+        return cached
+
+    inner = getattr(model, "model", None)
+    if inner is None:
+        inner = getattr(model, "language_model", None)
+    load_fn = getattr(inner, "load_weights", None) if inner is not None else None
+    result = False
+    if load_fn is not None:
+        try:
+            src = inspect.getsource(load_fn)
+            uses_autoloader = "AutoWeightsLoader" in src
+            uses_params_dict = "params_dict[" in src or "params_dict.get(" in src
+            result = uses_params_dict and not uses_autoloader
+        except (OSError, TypeError):
+            result = False
+    _inner_load_weights_is_strict_cache[cls] = result
+    return result
+
+
 def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
-    """Reconcile an incoming weight-sync name with the live vLLM namespace by
-    toggling one ``.base_layer`` segment (strip for non-wrapped modules, add for
-    LoRA-wrapped leaves) and routing packed routed-expert aliases under the LoRA
-    ``base_layer``. Returns the unmapped name — vLLM's ``load_weights`` does the
-    stacking (returning a mapped name would double-map, e.g. ``in_proj_qkvz`` ->
-    ``in_proj_qkvzz``, corrupting shard_id).
+    """Reconcile an incoming weight-sync name with the live vLLM namespace.
+
+    Toggles one ``.base_layer`` segment: STRIP for flat loaders (AutoWeightsLoader
+    recursion, e.g. Llama/Qwen3.5) and non-LoRA modules; KEEP for strict loaders
+    (params_dict[name] lookup, e.g. DeepseekV2/DSV3/DSV4) and released vLLM. Also
+    routes packed routed-expert aliases under the LoRA base_layer so
+    AutoWeightsLoader reaches MoERunner.load_weights.
+
+    The loader style is probed per inner-model class at runtime
+    (``_inner_load_weights_is_strict``), not by model_type. The mapper /
+    packed_modules_mapping decide the toggle only; the return is always the
+    unmapped name (vLLM does the stacking — returning a mapped name would
+    double-map, corrupting shard_id).
     """
     mapper = getattr(model, "hf_to_vllm_mapper", None)
     packed = getattr(model, "packed_modules_mapping", None) or {}
@@ -187,22 +237,66 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
                             return True
         return False
 
-    # Strip .base_layer when the inner name is the live one (module NOT
-    # LoRA-wrapped: aux models / non-wrapped submodules like the Qwen3.5-VL vision
-    # merger). Keep it when the module IS wrapped — the sender emits the
-    # live-namespace name and both AutoWeightsLoader and strict loaders accept it.
-    model_has_base_layer = any(".base_layer." in n for n in model_weight_names)
+    # Per-expert routed leaf: ``mlp.experts.<id>.<proj>[.base_layer].<leaf>``.
+    # ``FusedMoEWithLoRA`` exposes only the ``base_layer`` child; the numeric
+    # ``<id>`` is NOT a child module, so AutoWeightsLoader recurses into it and
+    # raises ``ValueError: no module named '...experts.<id>'``. Route the leaf
+    # UNDER ``base_layer`` so the loader descends into ``MoERunner.load_weights``
+    # → ``routed_experts.load_weights`` (which peels ``base_layer.`` and matches
+    # ``<id>.<proj>.<leaf>`` as a contiguous substring). Strict loaders
+    # (DeepseekV2/Moonlight) keep the suffix verbatim instead.
+    marker = ".mlp.experts."
+    idx = name.find(marker)
+    if idx != -1:
+        tail = name[idx + len(marker) :]
+        is_per_expert_leaf = (
+            tail
+            and tail.split(".", 1)[0].isdigit()
+            and is_leaf
+            and any("mlp.experts.base_layer." in n for n, _ in model.named_parameters(remove_duplicate=False))
+        )
+        if is_per_expert_leaf:
+            if _inner_load_weights_is_strict(model):
+                # Strict: keep a live suffix; re-add it for a plain leaf.
+                if ".base_layer." not in tail:
+                    head = name[: idx + len(marker)] + tail
+                    prefix, lf = head.rsplit(".", 1)
+                    alt = f"{prefix}.base_layer.{lf}"
+                    if alt in model_weight_names:
+                        return alt
+                return name
+            # Flat: route under base_layer, normalizing the leaf-suffix form.
+            if ".base_layer." in tail:
+                tail = tail.replace(".base_layer.", ".", 1)
+            return name[: idx + len(marker)] + "base_layer." + tail
+
+    # Per-name .base_layer. toggle (a mixed model like Qwen3.5-VL has it on
+    # LoRA language layers but not the vision merger). _exists consults the
+    # mapper's prefix rewrites so a Bridge-exported prefix reconciles against
+    # the live vLLM namespace.
     if ".base_layer." in name:
+        parent, _, _ = name.partition(".base_layer.")
+        parent_has_base_layer = _exists(parent + ".base_layer.weight") or any(
+            n.startswith(parent + ".base_layer.") for n in model_weight_names
+        )
         stripped = name.replace(".base_layer.", ".", 1)
-        if not model_has_base_layer or _exists(stripped):
-            return stripped
+        if parent_has_base_layer:
+            # Real LoRA leaf: strip for flat loaders, keep for strict/released.
+            if _HAS_LORA_LOAD_WEIGHTS and not _inner_load_weights_is_strict(model):
+                return stripped
+        else:
+            # No real base_layer child: strip unless strict loader and the
+            # stripped name isn't live (routed MoE expert — the expert mapping
+            # injects base_layer., so keeping the suffix avoids a KeyError).
+            if not (_HAS_LORA_LOAD_WEIGHTS and _inner_load_weights_is_strict(model)) or _exists(stripped):
+                return stripped
 
     if _exists(name):
         return name
 
-    # Route packed routed-expert aliases under the LoRA base_layer so
-    # AutoWeightsLoader reaches MoERunner.load_weights (FusedMoE3DWithLoRA has no
-    # load_weights). Non-leaf only.
+    # Routed-expert alias: route under the LoRA base_layer so AutoWeightsLoader
+    # reaches MoERunner.load_weights (FusedMoEWithLoRA has no load_weights
+    # itself).
     marker = ".mlp.experts."
     idx = name.find(marker)
     if idx != -1:
@@ -211,7 +305,7 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
             tail
             and ".base_layer." not in tail
             and not is_leaf
-            and any("mlp.experts.base_layer." in n for n in model_weight_names)
+            and any("mlp.experts.base_layer." in n for n, _ in model.named_parameters(remove_duplicate=False))
         ):
             return name.replace(marker, marker + "base_layer.", 1)
 
@@ -220,17 +314,15 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
         if _exists(stripped):
             return stripped
 
-    # LoRA-wrapped leaf: add .base_layer so the incoming plain name matches the
-    # live namespace (e.g. the MoE router ``mlp.gate.weight`` -> ``.base_layer.``).
-    # Expert leaves (``experts.{i}.{proj}.weight``) are a checkpoint-pattern the
-    # loader substring-matches, not a live param — skip the _exists check.
-    if is_leaf and ".base_layer." not in name and model_has_base_layer:
-        prefix, lf = name.rsplit(".", 1)
-        alt = f"{prefix}.base_layer.{lf}"
-        if alt != name:
-            parts = prefix.split(".")
-            _is_expert_leaf = len(parts) >= 3 and parts[-3] == "experts" and parts[-2].isdigit()
-            if _is_expert_leaf or _exists(alt):
+    # Leaf weight/bias: re-add ``.base_layer.`` for released vLLM (load_weights
+    # recurses into base_layer) and strict loaders (live key is suffixed). Flat
+    # loaders want the stripped name, handled above.
+    if is_leaf:
+        _needs_suffix = (not _HAS_LORA_LOAD_WEIGHTS) or _inner_load_weights_is_strict(model)
+        if _needs_suffix and ".base_layer." not in name:
+            prefix, lf = name.rsplit(".", 1)
+            alt = f"{prefix}.base_layer.{lf}"
+            if alt != name and _exists(alt):
                 return alt
 
     return name

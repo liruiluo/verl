@@ -75,17 +75,15 @@ except ImportError:
 
 
 def _patch_lora_moe_expert_mapping_order(model):
-    """Reorder the swapped ``param_name`` segments vLLM's
-    ``fused_moe_make_expert_params_mapping`` produces for LoRA-wrapped MoE.
+    """Reorder swapped ``param_name`` segments in vLLM's
+    ``fused_moe_make_expert_params_mapping`` for LoRA-wrapped MoE.
 
-    The live LoRA tree is ``experts.base_layer.routed_experts.w13_weight`` but the
-    function builds ``experts.routed_experts.base_layer.w13_`` (segments swapped),
-    so strict loaders' ``params_dict[name]`` misses -> ``KeyError``. Only
-    DeepseekV2/DSV3 hit this (their ``load_weights`` is strict + calls the
-    mapping); other MoE loaders use ``AutoWeightsLoader``. Idempotent; non-LoRA
+    The live LoRA tree is ``experts.base_layer.routed_experts.w13_weight`` but
+    the function builds ``experts.routed_experts.base_layer.w13_`` (segments
+    swapped), so strict loaders' ``params_dict[name]`` misses -> KeyError. Only
+    DeepseekV2/DSV3 hit this (strict + calls the mapping). Idempotent; non-LoRA
     mappings pass through.
     """
-    # Gate to DeepseekV2/DSV3 (the only strict MoE loader that calls the mapping).
     inner = getattr(model, "model", None) or getattr(model, "language_model", None)
     if inner is not None and type(inner).__name__ != "DeepseekV2Model":
         return
@@ -113,10 +111,8 @@ def _patch_lora_moe_expert_mapping_order(model):
     _wrapped._verl_original = _original
     _fused_moe.fused_moe_make_expert_params_mapping = _wrapped
 
-    # ``deepseek_v2.py`` binds this function by name at import time
-    # (``from ... import fused_moe_make_expert_params_mapping``), so patching only
-    # ``_fused_moe.<fn>`` leaves that binding on the original. Rebind every
-    # module still holding the original.
+    # deepseek_v2.py binds the name at import time (from ... import), so rebind
+    # every module still holding the original reference.
     import sys as _sys
 
     for _mod in list(_sys.modules.values()):
@@ -154,7 +150,7 @@ def patch_vllm_moe_model_weight_loader(model):
 
     original_model_type = type(model)
     # Unwrap graph-capture wrappers (ACL/CUDAGraphWrapper) so isinstance sees the
-    # real model; matching just "ACLGraphWrapper" missed CUDAGraphWrapper.
+    # real model.
     if hasattr(model, "runnable") and "GraphWrapper" in str(original_model_type):
         model = model.runnable
         original_model_type = type(model)
@@ -194,9 +190,10 @@ def patch_vllm_moe_model_weight_loader(model):
         if not experts:
             continue
 
-        # verl syncs plain HF names; clear the LoRA ``lora_base_layer_prefix``
-        # (a dotted param_name getattr can't resolve). Before the weight_loader
-        # guard so LoRA-wrapped MoE (no weight_loader) is covered.
+        # verl syncs plain HF names, not PEFT checkpoint names, so the LoRA MoE
+        # ``lora_base_layer_prefix`` (folded into a dotted param_name that
+        # getattr can't resolve) must be cleared. Runs before the
+        # ``weight_loader`` guard so LoRA-wrapped MoE (no weight_loader) is covered.
         routed_experts = getattr(getattr(experts, "base_layer", None), "routed_experts", None)
         if routed_experts is not None and getattr(routed_experts, "lora_base_layer_prefix", ""):
             routed_experts.lora_base_layer_prefix = ""
@@ -209,6 +206,5 @@ def patch_vllm_moe_model_weight_loader(model):
             if "w13_weight" in name or "w2_weight" in name:
                 param.weight_loader = experts.weight_loader
 
-    # LoRA-wrapped MoE: reorder the swapped ``param_name`` segments (see helper
-    # above). Gated to DeepseekV2/DSV3 inside the helper.
+    # LoRA-wrapped MoE: reorder swapped expert mapping segments (see helper).
     _patch_lora_moe_expert_mapping_order(model)

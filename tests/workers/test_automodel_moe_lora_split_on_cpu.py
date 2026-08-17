@@ -14,12 +14,11 @@
 
 """CPU tests for the phase-2 MoE-LoRA adapter key split in the automodel engine.
 
-Phase-2 LoRA rollout weight sync sends Automodel's fused 3D
-``GroupedExpertsLoRA`` adapter params (``lora_gate_and_up_A/B`` fused w1+w3,
-``lora_down_A/B`` = w2) to vLLM ``add_lora``. vLLM expects per-expert
-``<prefix>.{i}.{gate_proj,up_proj,down_proj}.lora_{A,B}.weight`` 2D tensors
-that ``PackedLoRALayerWeights.pack_moe`` regroups into the ``[w1, w2, w3]``
-lists ``FusedMoEWithLoRA.set_lora`` consumes. These tests pin that mapping.
+Phase-2 LoRA weight sync sends Automodel's fused 3D ``GroupedExpertsLoRA``
+adapter params (``lora_gate_and_up_A/B`` fused w1+w3, ``lora_down_A/B`` = w2) to
+vLLM ``add_lora``, which expects per-expert
+``<prefix>.{i}.{gate_proj,up_proj,down_proj}.lora_{A,B}.weight`` 2D tensors.
+These tests pin that mapping (and the merge path).
 """
 
 import torch
@@ -303,13 +302,12 @@ def test_collect_moe_lora_prefixes_normalizes_checkpoint_wrapper():
 
 
 # ---------------------------------------------------------------------------
-# Phase-1: LoRA-wrapped MoE expert_params_mapping base_layer/routed_experts
-# ordering. The legacy ``fused_moe_make_expert_params_mapping`` builds
-# ``param_name = experts.routed_experts.base_layer.w13_`` but the live LoRA
-# tree is ``experts.base_layer.routed_experts.w13_weight``. verl wraps the
-# module-level function (see ``verl.utils.vllm.patch``) to reorder the
-# ``param_name`` segments so the strict loader's ``params_dict[name_mapped]``
-# resolves.
+# Phase-1: LoRA-wrapped MoE expert_params_mapping ordering. The legacy
+# ``fused_moe_make_expert_params_mapping`` builds ``param_name =
+# experts.routed_experts.base_layer.w13_`` but the live LoRA tree is
+# ``experts.base_layer.routed_experts.w13_weight``. verl wraps the module-level
+# function (see ``verl.utils.vllm.patch``) to reorder the segments so the strict
+# loader's ``params_dict[name_mapped]`` resolves.
 # ---------------------------------------------------------------------------
 
 

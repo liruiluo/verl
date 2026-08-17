@@ -488,17 +488,37 @@ class AutomodelEngine(BaseEngine):
         def param_generator():
             lora_base_sync = self.peft_config is not None and not base_sync_done
 
+            # vLLM wraps every linear leaf as ``.base_layer.`` under enable_lora;
+            # phase-1 base keys must carry the suffix to match. Detect linear
+            # leaves (weight/bias with ndim>=2) at runtime; lora_* submodules and
+            # per-expert split leaves (added from the split specs) are handled.
+            _linear_leaf_basenames = set()
+            if lora_base_sync:
+                for _mname, _mod in self.module.named_modules():
+                    for _pname, _p in _mod.named_parameters(recurse=False):
+                        if _pname in ("weight", "bias") and _p.ndim >= 2:
+                            _leaf = _mname.rpartition(".")[-1]
+                            if not _leaf.startswith("lora_"):
+                                _linear_leaf_basenames.add(_leaf)
+                            break
+                for _spec in packed_expert_prefixes.values():
+                    for _sub_names in _spec.splits:
+                        _linear_leaf_basenames.update(_sub_names)
+
             def _remap(key):
                 if not lora_base_sync:
                     return key
-                # Insert .base_layer for patched-linear keys (vLLM's LoRA namespace);
-                # skip lm_head/embed (ParallelLMHead/VocabParallelEmbedding, not wrapped).
+                # lm_head/embed are not LinearBase (ParallelLMHead/VocabParallelEmbedding).
                 if key.endswith("lm_head.weight") or key.endswith("embed_tokens.weight"):
+                    return key
+                module_k, _, _param_leaf = key.rpartition(".")
+                _, _, mod_leaf = module_k.rpartition(".")
+                if mod_leaf not in _linear_leaf_basenames:
                     return key
                 for prefix in lora_linear_prefixes:
                     if key.startswith(prefix + "."):
                         return f"{prefix}.base_layer.{key[len(prefix) + 1 :]}"
-                return key
+                return f"{module_k}.base_layer.{key[len(module_k) + 1 :]}"
 
             for name, param in params.items():
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
@@ -516,8 +536,11 @@ class AutomodelEngine(BaseEngine):
                     continue
                 yield _remap(name), unsharded_tensor
 
-        # Return peft_config for both LoRA phases (mirrors FSDP): phase 1 uses it as
-        # the "LoRA-wrapped, resolve names" signal; add_lora fires in phase 2.
+        # Both phases return non-null peft_config so the rollout routes phase-1
+        # base keys and phase-2 adapter tensors through resolve_weight_name
+        # (same path FSDP/Megatron use). The resolver keeps .base_layer. for
+        # strict loaders and strips it for flat loaders, so _remap's suffixed
+        # keys reconcile across architectures. Phase 2 short-circuits to add_lora.
         peft_config_dict = to_vllm_peft_dict(self.peft_config) if self.peft_config is not None else None
         return param_generator(), peft_config_dict
 
@@ -525,9 +548,8 @@ class AutomodelEngine(BaseEngine):
         """Stream full HF-keyed base params with LoRA adapters folded in
         (``model.lora.merge=true``). Returns ``peft_config=None`` — the rollout
         has ``enable_lora`` disabled and expects a standard weight update."""
-        # Split rules for the two packed base attrs of a GroupedExpertsLoRA module.
-        # (collect_automodel_lora_param_maps routes LoRA experts to moe_lora_modules,
-        # NOT packed_expert_prefixes, so build the split specs inline here.)
+        # Split rules for GroupedExpertsLoRA packed base attrs. LoRA experts are
+        # in moe_lora_modules (not packed_expert_prefixes), so build specs inline.
         _MERGE_SPLITS = {
             "gate_and_up_projs": (("gate_proj", "up_proj"),),
             "down_projs": (("down_proj",),),
@@ -535,15 +557,14 @@ class AutomodelEngine(BaseEngine):
 
         for name, param in params.items():
             if "lora_" in name:
-                continue  # adapters are folded into the base below; skip standalone.
+                continue  # adapters folded into the base below; skip standalone.
             # Dense LinearLoRA base weight: fold base + scale*(B@A).
             base_leaf = name.rsplit(".", 1)[-1]
             prefix = name[: -len(base_leaf) - 1] if "." in name else ""
             if base_leaf == "weight" and prefix in dense_lora_modules:
                 yield name, merged_dense_lora_weight(dense_lora_modules[prefix])
                 continue
-            # Packed MoE expert base: LoRA-expert modules aren't in
-            # packed_expert_prefixes, so detect via the attr leaf + moe_lora_modules.
+            # Packed MoE expert base (LoRA experts detected via moe_lora_modules).
             if base_leaf in _MERGE_SPLITS and prefix in moe_lora_modules:
                 module = moe_lora_modules[prefix]
                 merged = merged_packed_expert_base(module, base_leaf)
@@ -552,8 +573,8 @@ class AutomodelEngine(BaseEngine):
                     for sub_name, sub_tensor in split_packed_expert(spec, merged, expert_id):
                         yield f"{prefix}.{expert_id}.{sub_name}", sub_tensor
                 continue
-            # Non-LoRA base param (embeddings, lm_head, router, shared experts, norms):
-            # plain non-LoRA GroupedExperts still go through packed_expert_prefixes.
+            # Non-LoRA base param (embeddings, lm_head, router, shared experts,
+            # norms); plain non-LoRA GroupedExperts still go through packed_expert_prefixes.
             spec = packed_expert_prefixes.get(name)
             if spec is not None:
                 unsharded = param.full_tensor() if isinstance(param, DTensor) else param
@@ -820,29 +841,26 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-        with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
+        raw_output = self.module(
+            **model_inputs,
+            use_cache=False,
+        )
+
+        model_output = self.prepare_model_outputs(output=raw_output, output_args=output_args, micro_batch=micro_batch)
+
+        if loss_function is not None:
+            loss, metrics = loss_function(
+                model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
             )
+        else:
+            assert forward_only, "forward_only must be True when loss_function is None"
+            loss = torch.tensor(1.0, device=device_name)
+            metrics = {}
 
-            model_output = self.prepare_model_outputs(
-                output=raw_output, output_args=output_args, micro_batch=micro_batch
-            )
+        output = {
+            "model_output": model_output,
+            "loss": loss.detach().item(),
+            "metrics": metrics,
+        }
 
-            if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
-                )
-            else:
-                assert forward_only, "forward_only must be True when loss_function is None"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
-
-            output = {
-                "model_output": model_output,
-                "loss": loss.detach().item(),
-                "metrics": metrics,
-            }
-
-            return loss, output
+        return loss, output
