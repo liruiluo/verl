@@ -63,6 +63,7 @@ tracking metrics to diagnose and correct off-policy issues.
 import math
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 import verl.utils.torch_functional as verl_F
@@ -1104,6 +1105,50 @@ def compute_rollout_corr_metrics_from_logprobs(
             metrics_with_prefix[f"rollout_corr/{key}"] = value
 
     return metrics_with_prefix
+
+
+def compute_bypass_log_prob_evidence(batch: DataProto) -> dict[str, int | float]:
+    """Verify and summarize the bypass identity on real, loss-bearing tokens."""
+    required_keys = ("old_log_probs", "rollout_log_probs", "response_mask")
+    missing_keys = [key for key in required_keys if key not in batch.batch]
+    if missing_keys:
+        raise ValueError(f"bypass log-prob evidence requires batch keys {missing_keys}")
+
+    old_log_probs = batch.batch["old_log_probs"]
+    rollout_log_probs = batch.batch["rollout_log_probs"]
+    response_mask = batch.batch["response_mask"]
+    if old_log_probs.shape != rollout_log_probs.shape or old_log_probs.shape != response_mask.shape:
+        raise ValueError(
+            "old_log_probs, rollout_log_probs, and response_mask must have identical shapes for bypass evidence"
+        )
+
+    token_mask = response_mask.to(dtype=torch.bool)
+    is_padding = batch.non_tensor_batch.get("is_padding")
+    if is_padding is not None:
+        if not isinstance(is_padding, np.ndarray) or is_padding.ndim != 1 or len(is_padding) != len(batch):
+            raise ValueError("is_padding must be a one-dimensional row mask matching the batch size")
+        if any(not isinstance(value, (bool, np.bool_)) for value in is_padding):
+            raise ValueError("is_padding must contain only boolean row markers")
+        real_rows = ~torch.as_tensor(is_padding.astype(bool), device=token_mask.device)
+        row_mask_shape = (len(batch),) + (1,) * (token_mask.ndim - 1)
+        token_mask = token_mask & real_rows.reshape(row_mask_shape)
+
+    selected_old = old_log_probs[token_mask]
+    selected_rollout = rollout_log_probs[token_mask]
+    if not torch.isfinite(selected_old).all() or not torch.isfinite(selected_rollout).all():
+        raise RuntimeError("old_log_probs and rollout_log_probs contain non-finite real-token values in bypass mode")
+
+    absolute_difference = (selected_old - selected_rollout).abs()
+    max_abs_diff = absolute_difference.max().item() if absolute_difference.numel() else 0.0
+    if torch.any(absolute_difference != 0):
+        raise RuntimeError(
+            f"old_log_probs and rollout_log_probs mismatch on real tokens in bypass mode: max_abs_diff={max_abs_diff}"
+        )
+
+    return {
+        "rollout_corr/bypass_real_token_count": int(token_mask.sum().item()),
+        "rollout_corr/bypass_max_abs_diff": float(max_abs_diff),
+    }
 
 
 def apply_bypass_mode(

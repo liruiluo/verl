@@ -8,6 +8,21 @@ defaults:
 
 async_training:
 
+  # Atomic terminal runtime receipt. Null derives the path from trainer.default_local_dir.
+  runtime_receipt_path: null
+
+  # Bounded non-tensor rollout fields forwarded to the native JSONL dump.
+  rollout_data_non_tensor_keys: []
+  rollout_data_non_tensor_max_keys: 16
+
+  # Optional bounded before/after parameter samples on unified actor and critic workers.
+  parameter_update_probe:
+    enabled: false
+    max_parameters: 8
+    max_elements_per_parameter: 16
+    atol: 0.0
+    require_change: true
+
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 

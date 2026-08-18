@@ -12,11 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import sys
 import types
 from unittest.mock import MagicMock, call, patch
 
-from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
+from verl.utils.tracking import DapoFilteredRewardTableLogger, FileLogger, Tracking, ValidationGenerationsLogger
+
+
+def test_file_logger_explicit_path_overrides_environment(tmp_path, monkeypatch):
+    environment_path = tmp_path / "environment.jsonl"
+    explicit_path = tmp_path / "explicit.jsonl"
+    monkeypatch.setenv("VERL_FILE_LOGGER_PATH", str(environment_path))
+
+    logger = FileLogger("project", "experiment", filepath=str(explicit_path))
+    logger.log({"answer": 42}, step=3)
+    logger.finish()
+
+    assert not environment_path.exists()
+    assert json.loads(explicit_path.read_text()) == {"step": 3, "data": {"answer": 42}}
 
 
 def test_tracking_finish_finalizes_wandb_once():

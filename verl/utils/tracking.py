@@ -417,16 +417,18 @@ class _TrackioLoggingAdapter:
 
 
 class FileLogger:
-    def __init__(self, project_name: str, experiment_name: str):
+    def __init__(self, project_name: str, experiment_name: str, filepath: str | None = None):
         self.project_name = project_name
         self.experiment_name = experiment_name
 
-        self.filepath = os.getenv("VERL_FILE_LOGGER_PATH", None)
+        self.filepath = filepath if filepath is not None else os.getenv("VERL_FILE_LOGGER_PATH", None)
         if self.filepath is None:
             root_path = os.path.expanduser(os.getenv("VERL_FILE_LOGGER_ROOT", "."))
             directory = os.path.join(root_path, self.project_name)
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(self.filepath)), exist_ok=True)
         print(f"Creating file logger at {os.path.abspath(self.filepath)}")
         self.fp = open(self.filepath, "wb", buffering=0)
 

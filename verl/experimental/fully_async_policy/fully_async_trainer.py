@@ -20,7 +20,9 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -32,6 +34,11 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.runtime_evidence import (
+    PARAMETER_PROBE_HARD_MAX_ELEMENTS_PER_PARAMETER,
+    PARAMETER_PROBE_HARD_MAX_PARAMETERS,
+    compare_parameter_update_probes,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
@@ -44,6 +51,8 @@ from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
+
+ROLLOUT_DATA_NON_TENSOR_HARD_MAX_KEYS = 64
 
 
 class TrainingStopException(Exception):
@@ -58,6 +67,56 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
     Based on an improved implementation of OneStepOffRayTrainer
     """
+
+    @staticmethod
+    def _validate_rollout_data_non_tensor_keys(keys, maximum_keys: int) -> tuple[str, ...]:
+        if isinstance(maximum_keys, bool) or not isinstance(maximum_keys, int) or maximum_keys <= 0:
+            raise ValueError(f"rollout_data_non_tensor_max_keys must be a positive integer, got {maximum_keys!r}")
+        if maximum_keys > ROLLOUT_DATA_NON_TENSOR_HARD_MAX_KEYS:
+            raise ValueError(
+                f"rollout_data_non_tensor_max_keys exceeds the hard maximum of {ROLLOUT_DATA_NON_TENSOR_HARD_MAX_KEYS}"
+            )
+        keys = list(keys or [])
+        if any(not isinstance(key, str) or not key for key in keys):
+            raise ValueError("rollout_data_non_tensor_keys must contain non-empty strings")
+        if len(set(keys)) != len(keys):
+            raise ValueError("rollout_data_non_tensor_keys must not contain duplicate keys")
+        reserved_keys = {"input", "output", "gts", "score", "step"}
+        if reserved_keys.intersection(keys):
+            raise ValueError("rollout_data_non_tensor_keys must not override native rollout dump fields")
+        if len(keys) > maximum_keys:
+            raise ValueError(f"rollout_data_non_tensor_keys may contain at most {maximum_keys} keys")
+        return tuple(keys)
+
+    @staticmethod
+    def _validate_parameter_update_probe_config(config) -> dict[str, Any]:
+        config = dict(config or {})
+        validated = {
+            "enabled": config.get("enabled", False),
+            "max_parameters": config.get("max_parameters", 8),
+            "max_elements_per_parameter": config.get("max_elements_per_parameter", 16),
+            "atol": config.get("atol", 0.0),
+            "require_change": config.get("require_change", True),
+        }
+        if not isinstance(validated["enabled"], bool):
+            raise ValueError("parameter_update_probe.enabled must be a boolean")
+        if not isinstance(validated["require_change"], bool):
+            raise ValueError("parameter_update_probe.require_change must be a boolean")
+        limits = (
+            ("max_parameters", PARAMETER_PROBE_HARD_MAX_PARAMETERS),
+            ("max_elements_per_parameter", PARAMETER_PROBE_HARD_MAX_ELEMENTS_PER_PARAMETER),
+        )
+        for key, hard_maximum in limits:
+            value = validated[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"parameter_update_probe.{key} must be a positive integer")
+            if value > hard_maximum:
+                raise ValueError(f"parameter_update_probe.{key} exceeds the hard maximum of {hard_maximum}")
+        atol = validated["atol"]
+        if isinstance(atol, bool) or not isinstance(atol, int | float) or not math.isfinite(atol) or atol < 0:
+            raise ValueError("parameter_update_probe.atol must be a finite non-negative number")
+        validated["atol"] = float(atol)
+        return validated
 
     def __init__(
         self,
@@ -138,10 +197,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.message_queue_client = None
 
+        rollout_data_max_keys = config.async_training.get("rollout_data_non_tensor_max_keys", 16)
+        self.rollout_data_non_tensor_keys = self._validate_rollout_data_non_tensor_keys(
+            config.async_training.get("rollout_data_non_tensor_keys", []), rollout_data_max_keys
+        )
+        self.parameter_update_probe_config = self._validate_parameter_update_probe_config(
+            config.async_training.get("parameter_update_probe", {})
+        )
+        self.latest_bypass_log_prob_evidence = {}
+        self.latest_parameter_update_probe = {}
+
         # Statistics
         self.local_trigger_step = 1
         self.processed_samples = 0
         self.stale_trajectory_processed = 0
+        self.terminal_underfill_events = 0
         self.terminal_underfill_samples = 0
         self.current_param_version = 0
         self.total_train_steps = None
@@ -373,6 +443,60 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Get actor worker group"""
         return self.actor_wg
 
+    def finalize_runtime_evidence(self) -> None:
+        """Drain the native background rollout-dump executor before terminal evidence."""
+        if not self._dump_executor._shutdown:
+            try:
+                self._shutdown_dump_executor()
+            finally:
+                if not self._dump_executor._shutdown:
+                    self._dump_executor.shutdown(wait=True)
+
+    def get_statistics(self) -> dict[str, Any]:
+        """Return trainer-owned fully-async counters and the latest bounded evidence."""
+        return {
+            "global_steps": self.global_steps,
+            "current_param_version": self.current_param_version,
+            "total_train_steps": self.total_train_steps,
+            "local_trigger_step": self.local_trigger_step,
+            "processed_samples": self.processed_samples,
+            "stale_trajectory_processed": self.stale_trajectory_processed,
+            "terminal_underfill_events": self.terminal_underfill_events,
+            "terminal_underfill_samples": self.terminal_underfill_samples,
+            "pending_rollout_dump_writes": len(self._dump_futures),
+            "latest_bypass_log_prob_evidence": dict(self.latest_bypass_log_prob_evidence),
+            "latest_parameter_update_probe": dict(self.latest_parameter_update_probe),
+        }
+
+    def _capture_parameter_update_probe(self, worker_group):
+        config = getattr(self, "parameter_update_probe_config", {"enabled": False})
+        if not config.get("enabled", False):
+            return None
+        return worker_group.parameter_update_probe(
+            max_parameters=config["max_parameters"],
+            max_elements_per_parameter=config["max_elements_per_parameter"],
+        )
+
+    def _record_parameter_update_probe(self, role: str, before, after) -> dict[str, Any]:
+        config = self.parameter_update_probe_config
+        expected_bounds = {
+            "max_parameters": config["max_parameters"],
+            "max_elements_per_parameter": config["max_elements_per_parameter"],
+        }
+        for boundary, payload in (("before", before), ("after", after)):
+            if not isinstance(payload, list) or any(
+                not isinstance(record, dict) or any(record.get(key) != value for key, value in expected_bounds.items())
+                for record in payload
+            ):
+                raise ValueError(f"{role} {boundary} parameter probe payload does not match configured bounds")
+        evidence = compare_parameter_update_probes(before, after, atol=config["atol"])
+        self.latest_parameter_update_probe[role] = evidence
+        for key, value in evidence.items():
+            self.metrics[f"parameter_update_probe/{role}/{key}"] = value
+        if config["require_change"] and not evidence["changed"]:
+            raise RuntimeError(f"{role} parameter update probe detected no sampled parameter change")
+        return evidence
+
     async def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
         """
         Get samples from message queue and compose gen_batch_output
@@ -405,7 +529,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             sample, queue_len = await self.message_queue_client.get_sample()
 
             if sample is None:
-                self.terminal_underfill_samples += len(queue_samples)
+                self.terminal_underfill_events = getattr(self, "terminal_underfill_events", 0) + 1
+                self.terminal_underfill_samples = getattr(self, "terminal_underfill_samples", 0) + len(queue_samples)
                 print(
                     f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
@@ -430,6 +555,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if not queue_samples or len(queue_samples) < self.required_samples:
             print("[FullyAsyncTrainer] not enough samples collected after loop")
             return None, None
+        self.processed_samples = getattr(self, "processed_samples", 0) + len(queue_samples)
         total_wait_time = consumer_end - consumer_start
 
         print(
@@ -726,17 +852,92 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 f"mini-batch multiple {batch_multiple}; _fit_generate must align the batch once before balancing"
             )
 
+    @staticmethod
+    def _slice_rollout_extra(value, real_row_mask: np.ndarray, batch_size: int, key: str):
+        try:
+            value_size = len(value)
+        except TypeError as exception:
+            raise ValueError(f"rollout dump extra {key!r} is not row-aligned") from exception
+        if value_size != batch_size:
+            raise ValueError(f"rollout dump extra {key!r} has {value_size} rows but the batch has {batch_size}")
+        if isinstance(value, np.ndarray):
+            return value[real_row_mask]
+        if hasattr(value, "detach"):
+            return value[torch.as_tensor(real_row_mask, device=value.device)]
+        return [item for item, keep in zip(value, real_row_mask, strict=True) if keep]
+
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ) -> None:
+        """Delegate a real-row-only, explicitly whitelisted batch to the native dump path."""
+        is_padding = batch.non_tensor_batch.get("is_padding")
+        if not isinstance(is_padding, np.ndarray) or is_padding.ndim != 1 or len(is_padding) != len(batch):
+            raise ValueError("is_padding must be a one-dimensional numpy row mask matching the rollout batch")
+        if any(not isinstance(value, (bool, np.bool_)) for value in is_padding):
+            raise ValueError("is_padding must contain only boolean row markers")
+        real_row_mask = ~is_padding.astype(bool)
+        if not real_row_mask.any():
+            raise ValueError("rollout dump contains no real rows after applying is_padding")
+
+        real_batch = batch.select_idxs(real_row_mask)
+        real_reward_extras = {
+            key: self._slice_rollout_extra(value, real_row_mask, len(batch), key)
+            for key, value in reward_extra_infos_dict.items()
+        }
+        for key in self.rollout_data_non_tensor_keys:
+            if key in batch.non_tensor_batch:
+                real_reward_extras[key] = self._slice_rollout_extra(
+                    batch.non_tensor_batch[key], real_row_mask, len(batch), key
+                )
+        super()._log_rollout_data(real_batch, real_reward_extras, timing_raw, rollout_data_dir)
+
+    @staticmethod
+    def _bypass_mode_enabled(config) -> bool:
+        algorithm = getattr(config, "algorithm", None)
+        if algorithm is None:
+            return False
+        rollout_correction = (
+            algorithm.get("rollout_correction", None)
+            if hasattr(algorithm, "get")
+            else getattr(algorithm, "rollout_correction", None)
+        )
+        if rollout_correction is None:
+            return False
+        return bool(
+            rollout_correction.get("bypass_mode", False)
+            if hasattr(rollout_correction, "get")
+            else getattr(rollout_correction, "bypass_mode", False)
+        )
+
     def _update_critic(self, batch: DataProto) -> DataProto:
         critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         self._assert_role_batch_alignment(batch, critic_mini_batch_size, "critic")
-        return super()._update_critic(batch)
+        critic_worker_group = getattr(self, "critic_wg", None)
+        before_probe = self._capture_parameter_update_probe(critic_worker_group)
+        output = super()._update_critic(batch)
+        if before_probe is not None:
+            after_probe = self._capture_parameter_update_probe(critic_worker_group)
+            self._record_parameter_update_probe("critic", before_probe, after_probe)
+        return output
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         actor_mini_batch_size = (
             self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         )
         self._assert_role_batch_alignment(batch, actor_mini_batch_size, "actor")
-        return super()._update_actor(batch)
+        actor_worker_group = getattr(self, "actor_rollout_wg", None)
+        before_probe = self._capture_parameter_update_probe(actor_worker_group)
+        if self._bypass_mode_enabled(self.config):
+            from verl.trainer.ppo.rollout_corr_helper import compute_bypass_log_prob_evidence
+
+            bypass_evidence = compute_bypass_log_prob_evidence(batch)
+            self.latest_bypass_log_prob_evidence = bypass_evidence
+            self.metrics.update(bypass_evidence)
+        output = super()._update_actor(batch)
+        if before_probe is not None:
+            after_probe = self._capture_parameter_update_probe(actor_worker_group)
+            self._record_parameter_update_probe("actor", before_probe, after_probe)
+        return output
 
     def _fit_collect_metrics(self, batch: DataProto) -> None:
         is_padding = batch.non_tensor_batch.get("is_padding")

@@ -28,6 +28,10 @@ from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
+from verl.experimental.fully_async_policy.runtime_evidence import (
+    PARAMETER_PROBE_HARD_MAX_ELEMENTS_PER_PARAMETER,
+    PARAMETER_PROBE_HARD_MAX_PARAMETERS,
+)
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
@@ -56,6 +60,100 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _evenly_spaced_indices(length: int, maximum_count: int) -> list[int]:
+    """Choose a deterministic spread, including both ends whenever possible."""
+    count = min(length, maximum_count)
+    if count <= 0:
+        return []
+    if count == 1:
+        return [length // 2]
+    denominator = count - 1
+    return [(index * (length - 1) + denominator // 2) // denominator for index in range(count)]
+
+
+def collect_parameter_update_probe(module, max_parameters: int, max_elements_per_parameter: int) -> dict:
+    """Sample a bounded, deterministic spread of local parameter shards."""
+    limits = (
+        ("max_parameters", max_parameters, PARAMETER_PROBE_HARD_MAX_PARAMETERS),
+        (
+            "max_elements_per_parameter",
+            max_elements_per_parameter,
+            PARAMETER_PROBE_HARD_MAX_ELEMENTS_PER_PARAMETER,
+        ),
+    )
+    for name, value, hard_maximum in limits:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if value > hard_maximum:
+            raise ValueError(f"{name} exceeds the hard maximum of {hard_maximum}")
+
+    if hasattr(module, "named_parameters"):
+        named_parameters = module.named_parameters()
+    elif isinstance(module, (list, tuple)):
+        named_parameters = (
+            (f"module_{module_index}.{name}", parameter)
+            for module_index, model_part in enumerate(module)
+            for name, parameter in model_part.named_parameters()
+        )
+    else:
+        raise TypeError(f"parameter probe requires a module or module sequence, got {type(module)!r}")
+
+    local_candidates = []
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad:
+            continue
+        local_parameter = parameter.detach()
+        to_local = getattr(local_parameter, "to_local", None)
+        if callable(to_local):
+            local_parameter = to_local()
+        if local_parameter.numel() > 0:
+            local_candidates.append((name, local_parameter))
+
+    parameter_indices = _evenly_spaced_indices(len(local_candidates), max_parameters)
+    parameters = []
+    sampled_tensors = []
+    for parameter_index in parameter_indices:
+        name, local_parameter = local_candidates[parameter_index]
+        flat_parameter = local_parameter.reshape(-1)
+        sample_indices = _evenly_spaced_indices(flat_parameter.numel(), max_elements_per_parameter)
+        index_tensor = torch.tensor(sample_indices, device=flat_parameter.device, dtype=torch.long)
+        sampled_tensors.append(flat_parameter.index_select(0, index_tensor).to(dtype=torch.float64))
+        parameters.append(
+            {
+                "name": name,
+                "shape": list(local_parameter.shape),
+                "numel": local_parameter.numel(),
+                "sample_indices": sample_indices,
+                "values": [],
+            }
+        )
+
+    if sampled_tensors:
+        devices = {tensor.device for tensor in sampled_tensors}
+        if len(devices) != 1:
+            raise RuntimeError("parameter probe requires selected local shards to share one device")
+        # Standard FSDP2/DTensor workers have one local device. Concatenate the
+        # tiny samples before the host copy so the probe introduces one GPU
+        # synchronization rather than one synchronization per parameter.
+        combined_values = torch.cat(sampled_tensors).to(device="cpu").tolist()
+    else:
+        combined_values = []
+
+    sampled_elements = 0
+    for parameter in parameters:
+        sample_count = len(parameter["sample_indices"])
+        parameter["values"] = combined_values[sampled_elements : sampled_elements + sample_count]
+        sampled_elements += sample_count
+
+    return {
+        "max_parameters": max_parameters,
+        "max_elements_per_parameter": max_elements_per_parameter,
+        "sampled_parameters": len(parameters),
+        "sampled_elements": sampled_elements,
+        "parameters": parameters,
+    }
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -168,6 +266,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def parameter_update_probe(self, max_parameters: int, max_elements_per_parameter: int) -> dict:
+        return collect_parameter_update_probe(self.engine.module, max_parameters, max_elements_per_parameter)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
@@ -523,6 +625,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.actor.set_loss_fn(loss_fn=loss_fn)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def parameter_update_probe(self, max_parameters: int, max_elements_per_parameter: int) -> dict:
+        return self.actor.parameter_update_probe(max_parameters, max_elements_per_parameter)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):

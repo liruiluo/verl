@@ -25,6 +25,13 @@ from omegaconf import OmegaConf, open_dict
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
+from verl.experimental.fully_async_policy.runtime_evidence import (
+    atomic_write_runtime_receipt,
+    classify_exception,
+    queue_clear_delta_matches,
+    queue_conservation_holds,
+    utc_timestamp,
+)
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
@@ -42,11 +49,184 @@ class FullyAsyncTaskRunner:
         self.running = False
         self.components = {}
         self.shutdown_event = threading.Event()
+        self.run_started_at = None
 
     def run(self, config):
         print("[ASYNC MAIN] Starting fully async PPO training...")
-        self._initialize_components(config)
-        self._run_training_loop()
+        self.run_started_at = utc_timestamp()
+        self.components["config"] = config
+        primary_exception = None
+        primary_traceback = None
+        try:
+            self._initialize_components(config)
+            self._run_training_loop()
+        except BaseException as exception:
+            primary_exception = exception
+            primary_traceback = exception.__traceback__
+
+        finalization_exception = None
+        try:
+            finalization_exception = self._finalize_runtime_evidence(config, primary_exception)
+        except BaseException as exception:
+            finalization_exception = exception
+
+        if primary_exception is not None:
+            if finalization_exception is not None:
+                print(
+                    "[ASYNC MAIN] Runtime-evidence finalization also failed: "
+                    f"{classify_exception(finalization_exception)}"
+                )
+            raise primary_exception.with_traceback(primary_traceback)
+        if finalization_exception is not None:
+            raise finalization_exception
+
+    @staticmethod
+    def _unavailable_statistics_record(exception: BaseException) -> dict:
+        return {
+            "timestamp": utc_timestamp(),
+            "available": False,
+            "error": classify_exception(exception),
+        }
+
+    def _capture_statistics(self, component_name: str) -> tuple[dict, BaseException | None]:
+        component_key = "message_queue_client" if component_name == "queue" else component_name
+        component = self.components.get(component_key)
+        if component is None:
+            exception = RuntimeError(
+                f"{component_name} statistics unavailable because the component is not initialized"
+            )
+            return self._unavailable_statistics_record(exception), exception
+        try:
+            if component_name == "queue":
+                statistics = asyncio.run(component.get_statistics())
+            else:
+                statistics = ray.get(component.get_statistics.remote())
+            if not isinstance(statistics, dict):
+                raise TypeError(f"{component_name} statistics must be a mapping, got {type(statistics).__name__}")
+            return {
+                "timestamp": utc_timestamp(),
+                "available": True,
+                "statistics": statistics,
+            }, None
+        except BaseException as exception:
+            return self._unavailable_statistics_record(exception), exception
+
+    def _capture_statistics_boundary(self, boundary: str) -> tuple[dict, list[tuple[str, BaseException]]]:
+        snapshot = {"timestamp": utc_timestamp()}
+        errors = []
+        for component_name in ("trainer", "rollouter", "queue"):
+            record, exception = self._capture_statistics(component_name)
+            snapshot[component_name] = record
+            if exception is not None:
+                errors.append((f"{boundary}.{component_name}", exception))
+        return snapshot, errors
+
+    @staticmethod
+    def _statistics_from_record(record: dict) -> dict | None:
+        if not record.get("available", False):
+            return None
+        statistics = record.get("statistics")
+        return statistics if isinstance(statistics, dict) else None
+
+    @staticmethod
+    def _runtime_receipt_path(config) -> str:
+        configured_path = config.async_training.get("runtime_receipt_path", None)
+        if configured_path:
+            return configured_path
+        return os.path.join(config.trainer.default_local_dir, "fully_async_runtime_receipt.jsonl")
+
+    def _finalize_runtime_evidence(self, config, primary_exception: BaseException | None) -> BaseException | None:
+        finalization_started_at = utc_timestamp()
+        finalization_errors: list[tuple[str, BaseException]] = []
+
+        trainer = self.components.get("trainer")
+        if trainer is not None:
+            try:
+                ray.get(trainer.finalize_runtime_evidence.remote())
+            except BaseException as exception:
+                finalization_errors.append(("trainer.rollout_dump", exception))
+
+        before_clear, boundary_errors = self._capture_statistics_boundary("before_clear")
+        finalization_errors.extend(boundary_errors)
+
+        message_queue_client = self.components.get("message_queue_client")
+        if message_queue_client is not None:
+            try:
+                asyncio.run(message_queue_client.clear_queue())
+            except BaseException as exception:
+                finalization_errors.append(("queue.clear", exception))
+
+        after_clear, boundary_errors = self._capture_statistics_boundary("after_clear")
+        finalization_errors.extend(boundary_errors)
+
+        before_queue_statistics = self._statistics_from_record(before_clear["queue"])
+        after_queue_statistics = self._statistics_from_record(after_clear["queue"])
+        before_queue_conserved = queue_conservation_holds(before_queue_statistics)
+        after_queue_conserved = queue_conservation_holds(after_queue_statistics)
+        clear_delta_matches_resident = queue_clear_delta_matches(before_queue_statistics, after_queue_statistics)
+        if before_queue_statistics is not None and not before_queue_conserved:
+            finalization_errors.append(
+                ("queue.conservation.before_clear", RuntimeError("queue conservation failed before clear"))
+            )
+        if after_queue_statistics is not None and not after_queue_conserved:
+            finalization_errors.append(
+                ("queue.conservation.after_clear", RuntimeError("queue conservation failed after clear"))
+            )
+        if (
+            before_queue_statistics is not None
+            and after_queue_statistics is not None
+            and not clear_delta_matches_resident
+        ):
+            finalization_errors.append(
+                ("queue.conservation.clear_delta", RuntimeError("queue clear delta does not match resident samples"))
+            )
+
+        effective_exception = primary_exception
+        if effective_exception is None and finalization_errors:
+            effective_exception = finalization_errors[0][1]
+
+        trainer_statistics = self._statistics_from_record(before_clear["trainer"])
+        if trainer_statistics is None:
+            trainer_statistics = self._statistics_from_record(after_clear["trainer"])
+        terminal_underfill_events = (trainer_statistics or {}).get("terminal_underfill_events", 0)
+        if effective_exception is not None:
+            outcome, status = "crash", "failed"
+        elif terminal_underfill_events:
+            outcome, status = "terminal_underfill", "partial"
+        else:
+            outcome, status = "success", "completed"
+
+        receipt = {
+            "schema_version": 1,
+            "outcome": outcome,
+            "status": status,
+            "exception": classify_exception(effective_exception) if effective_exception is not None else None,
+            "timestamps": {
+                "run_started_at": self.run_started_at,
+                "finalization_started_at": finalization_started_at,
+                "finalized_at": utc_timestamp(),
+            },
+            "snapshots": {
+                "before_clear": before_clear,
+                "after_clear": after_clear,
+            },
+            "queue_conservation": {
+                "before_clear": before_queue_conserved,
+                "after_clear": after_queue_conserved,
+                "clear_delta_matches_resident": clear_delta_matches_resident,
+            },
+            "finalization_errors": [
+                {"stage": stage, "exception": classify_exception(exception)} for stage, exception in finalization_errors
+            ],
+            "trainer_step": (trainer_statistics or {}).get("current_param_version", 0),
+        }
+        atomic_write_runtime_receipt(
+            self._runtime_receipt_path(config),
+            receipt,
+            project_name=config.trainer.project_name,
+            experiment_name=config.trainer.experiment_name,
+        )
+        return finalization_errors[0][1] if finalization_errors else None
 
     def _initialize_components(self, config) -> None:
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
@@ -263,7 +443,6 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 
 
