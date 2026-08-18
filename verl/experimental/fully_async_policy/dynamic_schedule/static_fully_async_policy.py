@@ -43,7 +43,13 @@ class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
         return is_hybrid_active
 
     def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
-        return 0
+        # A standalone pool can keep producing after the hybrid pool sleeps, so
+        # static fully-async mode deactivates hybrid replicas immediately.  In a
+        # hybrid-only topology those replicas are the sole producer: retain one
+        # complete publication-cycle batch before handing the GPUs to training,
+        # otherwise the first activate/deactivate cycle leaves the learner
+        # waiting forever on an empty queue.
+        return ctx.step_required_samples if self.only_hybrid else 0
 
     def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         return
@@ -51,4 +57,4 @@ class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
     def should_activate_after_step(
         self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
     ) -> bool:
-        return False
+        return self.only_hybrid and not is_hybrid_active

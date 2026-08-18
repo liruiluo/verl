@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 from datetime import datetime
@@ -34,6 +35,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.padding_utils import upsample_dataproto_to_divisible_size
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -140,6 +142,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.local_trigger_step = 1
         self.processed_samples = 0
         self.stale_trajectory_processed = 0
+        self.terminal_underfill_samples = 0
         self.current_param_version = 0
         self.total_train_steps = None
         self.progress_bar = None
@@ -355,16 +358,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def set_total_train_steps(self, total_training_steps):
         self.total_train_steps = total_training_steps
+        optimizer_training_steps = total_training_steps * self.trigger_parameter_sync_step
 
-        try:
-            OmegaConf.set_struct(self.config, True)
-            with open_dict(self.config):
-                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-                if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
-        except Exception as e:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+        OmegaConf.set_struct(self.config, True)
+        with open_dict(self.config):
+            if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                self.config.actor_rollout_ref.actor.optim.total_training_steps = optimizer_training_steps
+            if OmegaConf.select(self.config, "critic.optim"):
+                self.config.critic.optim.total_training_steps = optimizer_training_steps
 
         self.progress_bar = tqdm(total=self.total_train_steps, initial=0, desc="Training Progress")
 
@@ -404,6 +405,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             sample, queue_len = await self.message_queue_client.get_sample()
 
             if sample is None:
+                self.terminal_underfill_samples += len(queue_samples)
                 print(
                     f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
@@ -438,10 +440,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
         # Assemble batch - now working directly with RolloutSample objects
-        if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         self._step_wait_times.append(total_wait_time)
@@ -474,7 +473,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     def _init_models(self):
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
+            self.critic_wg.reset()
+            from functools import partial
+
+            from verl.workers.utils.losses import value_loss
+
+            value_loss_ = partial(value_loss, config=self.orig_critic_cfg)
+            self.critic_wg.set_loss_fn(value_loss_)
 
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
@@ -490,6 +495,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        if self.total_train_steps is None or self.total_train_steps <= 0:
+            raise RuntimeError("A positive total training-step horizon must be set before worker initialization")
+
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
@@ -518,11 +526,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
-        while True:
+        while self.current_param_version < self.total_train_steps:
             try:
                 await self.fit_step()
             except TrainingStopException:
-                print("[FullyAsyncTrainer] Training stopped by queue termination signal")
+                print(
+                    "[FullyAsyncTrainer] Training stopped by queue termination signal; "
+                    f"terminal_underfill_samples={self.terminal_underfill_samples}"
+                )
+                self.logger.log(
+                    data={"fully_async/count/terminal_underfill_samples": self.terminal_underfill_samples},
+                    step=self.current_param_version,
+                )
                 break
 
         self.progress_bar.close()
@@ -640,6 +655,43 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.metrics["dynamic_resource/train_compute_time_s"] = train_compute_time
         self.metrics["dynamic_resource/train_allocated_time_s"] = allocated_time
 
+    @staticmethod
+    def _require_native_mini_batch_dp_alignment(*, role: str, mini_batch_size: int, dp_size: int) -> None:
+        """Fail before dispatch when a native global mini-batch cannot split by DP."""
+        if dp_size <= 0:
+            raise ValueError(f"{role} native DP size must be positive, got {dp_size}")
+        if mini_batch_size % dp_size != 0:
+            raise ValueError(
+                f"{role} global mini-batch size {mini_batch_size} must be divisible by native DP size {dp_size}"
+            )
+
+    def _get_required_batch_multiple(self) -> int:
+        """Return the alignment required by active model and optimizer paths."""
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        required_multiple = actor_dp_size
+
+        if self.use_critic:
+            critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * rollout_n
+            critic_dp_size = self._get_dp_size(self.critic_wg, "train")
+            self._require_native_mini_batch_dp_alignment(
+                role="critic",
+                mini_batch_size=critic_mini_batch_size,
+                dp_size=critic_dp_size,
+            )
+            required_multiple = math.lcm(required_multiple, critic_mini_batch_size, critic_dp_size)
+
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            actor_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
+            self._require_native_mini_batch_dp_alignment(
+                role="actor",
+                mini_batch_size=actor_mini_batch_size,
+                dp_size=actor_dp_size,
+            )
+            required_multiple = math.lcm(required_multiple, actor_mini_batch_size)
+
+        return required_multiple
+
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
         timing_raw = self.timing_raw
@@ -648,8 +700,49 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            if "attention_mask" in batch.batch:
+                batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(dim=-1).tolist()
+            batch_multiple = self._get_required_batch_multiple()
+            uid_group_divisor = None
+            if self.config.trainer.balance_batch and self.use_prefix_grouper:
+                uid_group_divisor = self._get_dp_size(self.actor_rollout_wg, "actor")
+            batch = upsample_dataproto_to_divisible_size(
+                batch,
+                batch_multiple=batch_multiple,
+                eos_token_id=self.tokenizer.eos_token_id,
+                uid_group_divisor=uid_group_divisor,
+            )
+            if self.config.trainer.balance_batch:
+                self._balance_batch(batch, metrics={})
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
+
+    @staticmethod
+    def _assert_role_batch_alignment(batch: DataProto, batch_multiple: int, role: str) -> None:
+        """Verify that shared padding already satisfies a role's native mini-batch contract."""
+        if len(batch) % batch_multiple != 0:
+            raise RuntimeError(
+                f"shared fully-async batch size {len(batch)} is not divisible by the {role} "
+                f"mini-batch multiple {batch_multiple}; _fit_generate must align the batch once before balancing"
+            )
+
+    def _update_critic(self, batch: DataProto) -> DataProto:
+        critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        self._assert_role_batch_alignment(batch, critic_mini_batch_size, "critic")
+        return super()._update_critic(batch)
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        actor_mini_batch_size = (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        )
+        self._assert_role_batch_alignment(batch, actor_mini_batch_size, "actor")
+        return super()._update_actor(batch)
+
+    def _fit_collect_metrics(self, batch: DataProto) -> None:
+        is_padding = batch.non_tensor_batch.get("is_padding")
+        if is_padding is not None:
+            batch = batch.select_idxs(~is_padding.astype(bool))
+        super()._fit_collect_metrics(batch)
 
     def _compute_old_log_prob(self, batch: DataProto):
         """

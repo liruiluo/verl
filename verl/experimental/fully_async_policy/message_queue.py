@@ -14,13 +14,46 @@
 
 import asyncio
 import logging
+import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import ray
 from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _sample_field(sample: Any, name: str):
+    if isinstance(sample, dict):
+        return sample.get(name)
+    return getattr(sample, name, None)
+
+
+@dataclass(frozen=True)
+class QueuePutReceipt:
+    incoming_admitted: bool
+    incoming_uid: Any = None
+    incoming_min_version: Any = None
+    incoming_max_version: Any = None
+    evicted_uid: Any = None
+    evicted_min_version: Any = None
+    evicted_max_version: Any = None
+    enqueue_sequence: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.incoming_admitted
+
+
+@dataclass(frozen=True)
+class _QueuedSample:
+    sample: Any
+    enqueued_at: float
+    sequence: int
+    uid: Any
+    min_version: Any
+    max_version: Any
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
@@ -49,28 +82,62 @@ class MessageQueue:
         self.total_produced = 0
         self.total_consumed = 0
         self.dropped_samples = 0
+        self.real_cleared = 0
+        self.last_dequeue_residence_s = 0.0
+        self._enqueue_sequence = 0
 
         print(f"[MessageQueue] initialized with max_queue_size={max_queue_size}")
 
-    async def put_sample(self, sample: Any) -> bool:
+    async def put_sample(
+        self,
+        sample: Any,
+        *,
+        uid: Any = None,
+        min_version: Any = None,
+        max_version: Any = None,
+    ) -> QueuePutReceipt:
         """
         Put a batch sample into the queue
 
         Args:
             sample: Sample data
+            uid: Stable identity for receipt/conservation accounting.
+            min_version: Minimum policy version used by the sample.
+            max_version: Maximum policy version used by the sample.
 
         Returns:
-            bool: Whether the sample was successfully put into the queue
+            Admission and optional resident-eviction metadata.
         """
         async with self._lock:
-            # If queue is full, remove the oldest sample (rarely happens)
-            is_drop = False
+            incoming_uid = uid if uid is not None else _sample_field(sample, "uid")
+            if incoming_uid is None:
+                incoming_uid = _sample_field(sample, "sample_id")
+            incoming_min_version = min_version if min_version is not None else _sample_field(sample, "min_version")
+            incoming_max_version = max_version if max_version is not None else _sample_field(sample, "max_version")
+            incoming_metadata = {
+                "incoming_uid": incoming_uid,
+                "incoming_min_version": incoming_min_version,
+                "incoming_max_version": incoming_max_version,
+            }
+            if not self.running:
+                return QueuePutReceipt(incoming_admitted=False, **incoming_metadata)
+
+            evicted = None
             if len(self.queue) >= self.max_queue_size:
-                self.queue.popleft()
+                evicted = self.queue.popleft()
                 self.dropped_samples += 1
-                is_drop = True
                 logger.warning("Queue full, dropped sample")
-            self.queue.append(sample)
+            self._enqueue_sequence += 1
+            self.queue.append(
+                _QueuedSample(
+                    sample=sample,
+                    enqueued_at=time.monotonic(),
+                    sequence=self._enqueue_sequence,
+                    uid=incoming_uid,
+                    min_version=incoming_min_version,
+                    max_version=incoming_max_version,
+                )
+            )
             self.total_produced += 1
 
             # Notify waiting consumers
@@ -78,9 +145,14 @@ class MessageQueue:
 
             if self.total_produced % 100 == 0:
                 print(f"MessageQueue stats: produced={self.total_produced}, queue_size={len(self.queue)}")
-            if is_drop:
-                return False
-            return True
+            return QueuePutReceipt(
+                incoming_admitted=True,
+                evicted_uid=evicted.uid if evicted is not None else None,
+                evicted_min_version=evicted.min_version if evicted is not None else None,
+                evicted_max_version=evicted.max_version if evicted is not None else None,
+                enqueue_sequence=self._enqueue_sequence,
+                **incoming_metadata,
+            )
 
     async def get_sample(self) -> Any | None:
         """
@@ -95,12 +167,13 @@ class MessageQueue:
 
             # If queue is closed and empty, return None
             if not self.running and len(self.queue) == 0:
-                return None
+                return None, 0
 
             # Get one sample
-            data = self.queue.popleft()
+            queued_sample = self.queue.popleft()
             self.total_consumed += 1
-            return data, len(self.queue)
+            self.last_dequeue_residence_s = max(0.0, time.monotonic() - queued_sample.enqueued_at)
+            return queued_sample.sample, len(self.queue)
 
     async def get_queue_size(self) -> int:
         """Get current queue length"""
@@ -116,6 +189,14 @@ class MessageQueue:
                 "total_consumed": self.total_consumed,
                 "dropped_samples": self.dropped_samples,
                 "max_queue_size": self.max_queue_size,
+                "closed": not self.running,
+                "real_enqueued": self.total_produced,
+                "real_consumed": self.total_consumed,
+                "real_evicted": self.dropped_samples,
+                "real_cleared": self.real_cleared,
+                "real_resident": len(self.queue),
+                "control_signals_enqueued": 0,
+                "last_dequeue_residence_s": self.last_dequeue_residence_s,
             }
 
     async def clear_queue(self):
@@ -123,6 +204,7 @@ class MessageQueue:
         async with self._lock:
             cleared_count = len(self.queue)
             self.queue.clear()
+            self.real_cleared += cleared_count
             logger.info(f"Cleared {cleared_count} samples from queue")
 
     async def shutdown(self):
@@ -144,7 +226,7 @@ class MessageQueue:
 
             if sample_count > 0:
                 # Estimate size of a single sample (simplified estimation)
-                sample = list(self.queue)[0]
+                sample = self.queue[0].sample
                 try:
                     sample_size = sys.getsizeof(sample)
                     # Since we now store RolloutSample directly, estimate based on its components
@@ -183,9 +265,21 @@ class MessageQueueClient:
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
 
-    async def put_sample(self, sample: Any) -> bool:
+    async def put_sample(
+        self,
+        sample: Any,
+        *,
+        uid: Any = None,
+        min_version: Any = None,
+        max_version: Any = None,
+    ) -> QueuePutReceipt:
         """Put batch into queue (async)"""
-        future = self.queue_actor.put_sample.remote(sample)
+        future = self.queue_actor.put_sample.remote(
+            sample,
+            uid=uid,
+            min_version=min_version,
+            max_version=max_version,
+        )
         return await asyncio.wrap_future(future.future())
 
     async def put_validate(self, data: Any) -> bool:

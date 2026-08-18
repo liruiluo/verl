@@ -20,7 +20,7 @@ from pprint import pprint
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
@@ -74,13 +74,61 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
+        configured_train_steps = config.trainer.get("total_training_steps", None)
+        if configured_train_steps is not None:
+            if isinstance(configured_train_steps, bool) or configured_train_steps <= 0:
+                raise RuntimeError(
+                    "trainer.total_training_steps must be a positive integer when explicit; "
+                    f"got {configured_train_steps!r}"
+                )
+            samples_per_publication = (
+                config.actor_rollout_ref.actor.ppo_mini_batch_size
+                * config.async_training.require_batches
+                * config.async_training.trigger_parameter_sync_step
+            )
+            explicit_rollout_steps = configured_train_steps * samples_per_publication
+            if int(explicit_rollout_steps) != explicit_rollout_steps:
+                raise RuntimeError(
+                    "Explicit training horizon does not map to an integral rollout-sample horizon: "
+                    f"{configured_train_steps} * {samples_per_publication} = {explicit_rollout_steps}"
+                )
+            # Reuse the native producer horizon instead of introducing a second
+            # stop channel.  FullyAsyncRollouter still applies the dataset/epoch
+            # cap and the readback below fails closed if it cannot honor the
+            # explicit trainer horizon.
+            with open_dict(config.rollout):
+                config.rollout.total_rollout_steps = int(explicit_rollout_steps)
+
+        print("[ASYNC MAIN] Constructing FullyAsyncRollouter to resolve the scheduler horizon...")
+        self.components["rollouter"] = FullyAsyncRollouter.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            processor=self.components["processor"],
+            device_name=config.trainer.device,
+        )
+        derived_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
+        if configured_train_steps is not None and derived_train_steps != configured_train_steps:
+            raise RuntimeError(
+                "FullyAsyncRollouter cannot honor explicit trainer.total_training_steps under the configured "
+                "dataset/epoch horizon: "
+                f"requested {configured_train_steps}, resolved {derived_train_steps}"
+            )
+        total_train_steps = derived_train_steps
+        if total_train_steps <= 0:
+            raise RuntimeError(
+                "trainer.total_training_steps must be positive when explicit, and the derived horizon must be "
+                f"positive when it is absent; got {total_train_steps}"
+            )
+        self.components["rollouter_total_train_steps"] = derived_train_steps
+        self.components["total_train_steps"] = total_train_steps
+
         print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
         self._create_trainer(config)
 
         print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
         self._setup_hybrid_worker_group(config)
 
-        print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
+        print("[ASYNC MAIN] Initializing FullyAsyncRollouter...")
         self._create_rollouter(config)
 
         print("[ASYNC MAIN] Setting up rollouter reference on trainer")
@@ -89,7 +137,11 @@ class FullyAsyncTaskRunner:
         # sync total_train_steps between rollouter and trainer
         total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
         print(f"total_train_steps {total_train_steps}")
-        ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
+        if total_train_steps != self.components["rollouter_total_train_steps"]:
+            raise RuntimeError(
+                "Precomputed rollouter horizon does not match the initialized rollouter: "
+                f"{self.components['rollouter_total_train_steps']} != {total_train_steps}"
+            )
 
         # max_queue_size
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
@@ -115,13 +167,8 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] All components initialized successfully")
 
     def _create_rollouter(self, config) -> None:
-        print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            processor=self.components["processor"],
-            device_name=config.trainer.device,
-        )
+        print("[ASYNC MAIN] Starting rollouter worker initialization...")
+        rollouter = self.components["rollouter"]
 
         # set_hybrid_worker_group must be called BEFORE init_workers() so that
         # _init_async_rollout_manager can pass the hybrid WG to ALM.create().
@@ -152,6 +199,7 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
+        ray.get(trainer.set_total_train_steps.remote(self.components["total_train_steps"]))
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")

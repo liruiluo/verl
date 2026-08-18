@@ -496,7 +496,12 @@ class CheckpointEngineManager:
             return {}
 
         # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
+        try:
+            await self.abort_replicas()
+        except Exception:
+            # Weight buffers are unchanged, so the previous serving state is safe.
+            await self.resume_generation_replicas()
+            raise
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -505,11 +510,14 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
 
-        # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
-
-        # 4. build process group
-        self.build_process_group(rollout)
+        # 3. release kv_cache and build the process group before any weight mutation.
+        try:
+            await self.release_kv_cache_replicas()
+            self.build_process_group(rollout)
+        except Exception:
+            await self.resume_kv_cache_replicas()
+            await self.resume_generation_replicas()
+            raise
 
         # 5. update weights of all workers
         results = ray.get(
@@ -533,7 +541,12 @@ class CheckpointEngineManager:
         await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+        try:
+            await self.resume_generation_replicas()
+        except Exception:
+            # Some replicas may already be serving; re-abort the whole set.
+            await self.abort_replicas()
+            raise
 
         return sync_metrics
 

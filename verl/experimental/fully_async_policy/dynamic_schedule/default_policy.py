@@ -66,6 +66,8 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     """
 
     def __init__(self, deactivate_ratio: float = 0.3, only_hybrid: bool = False):
+        if not 0.0 < deactivate_ratio <= 1.0:
+            raise ValueError(f"deactivate_ratio must be in (0, 1], got {deactivate_ratio}")
         self.deactivate_ratio = deactivate_ratio
         self.only_hybrid = only_hybrid
         self._recent_switch_overheads: list[float] = []
@@ -114,7 +116,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             self.deactivate_ratio = min(1.0, self.deactivate_ratio + ratio_delta)
         else:
             ratio_delta = -DEACTIVATE_RATIO_DECREASE_STEP
-            self.deactivate_ratio += ratio_delta
+            self.deactivate_ratio = max(0.0, self.deactivate_ratio + ratio_delta)
 
         print(
             f"[DefaultDynamicSchedulePolicy] step={global_steps} "
@@ -233,3 +235,4 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             )
         except Exception as e:
             print(f"[DefaultDynamicSchedulePolicy] request_rebalance failed at step {global_steps}: {e}")
+            raise

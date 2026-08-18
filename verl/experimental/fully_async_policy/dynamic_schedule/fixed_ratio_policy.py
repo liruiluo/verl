@@ -87,3 +87,4 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             )
         except Exception as e:
             print(f"[FixedRatioDynamicSchedulePolicy] request_rebalance failed at step {global_steps}: {e}")
+            raise

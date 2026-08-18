@@ -141,6 +141,26 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             f"{num_hybrid} hybrid replicas registered (sleeping, rank 0-{num_hybrid - 1})"
         )
 
+    async def _reconcile_hybrid_membership(self) -> None:
+        """Reconcile local hybrid tracking with the load balancer after an ambiguous RPC failure."""
+        active_addresses = set(await self.global_load_balancer.get_all_servers.remote())
+        for resource_id, replica in self.hybrid_replicas.items():
+            server_address = replica._server_address
+            if server_address in active_addresses:
+                if server_address not in self.server_addresses:
+                    self.server_addresses.append(server_address)
+                    self.server_handles.append(replica._server_handle)
+                self.alive_replicas[resource_id] = replica
+                self.alive_addresses[resource_id] = server_address
+                continue
+
+            if server_address in self.server_addresses:
+                index = self.server_addresses.index(server_address)
+                self.server_addresses.pop(index)
+                self.server_handles.pop(index)
+            self.alive_replicas.pop(resource_id, None)
+            self.alive_addresses.pop(resource_id, None)
+
     async def add_replicas(self, resource_ids: list[str]) -> int:
         """Activate multiple pre-registered hybrid replicas in a single batch RPC.
 
@@ -186,8 +206,6 @@ class FullyAsyncLLMServerManager(LLMServerManager):
                 if server_address not in self.server_addresses:
                     self.server_handles.append(server_handle)
                     self.server_addresses.append(server_address)
-                if replica not in self.rollout_replicas:
-                    self.rollout_replicas.append(replica)
                 self.alive_replicas[rid] = replica
                 self.alive_addresses[rid] = server_address
 
@@ -201,7 +219,24 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         except Exception as e:
             logger.error("[FullyAsyncLLMServerManager] Failed to batch activate replicas: %s", e)
-            return 0
+            try:
+                await self._reconcile_hybrid_membership()
+            except Exception as readback_error:
+                logger.error(
+                    "[FullyAsyncLLMServerManager] Failed to read back membership after activation failure: %s",
+                    readback_error,
+                )
+                # Make the compensating remove target every possibly committed
+                # replica when the authoritative readback is unavailable.
+                for rid in valid_resource_ids:
+                    replica = self.hybrid_replicas[rid]
+                    server_address = replica._server_address
+                    if server_address not in self.server_addresses:
+                        self.server_addresses.append(server_address)
+                        self.server_handles.append(replica._server_handle)
+                    self.alive_replicas[rid] = replica
+                    self.alive_addresses[rid] = server_address
+            raise
 
     async def remove_replicas(self, resource_ids: list[str]) -> int:
         """Deactivate multiple active hybrid replicas in a single batch RPC.
@@ -236,13 +271,10 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             # Clean up local tracking lists.
             for rid in valid_resource_ids:
                 server_address = self.alive_addresses[rid]
-                replica = self.alive_replicas[rid]
                 if server_address in self.server_addresses:
                     idx = self.server_addresses.index(server_address)
                     self.server_addresses.pop(idx)
                     self.server_handles.pop(idx)
-                if replica in self.rollout_replicas:
-                    self.rollout_replicas.remove(replica)
                 self.alive_replicas.pop(rid)
                 self.alive_addresses.pop(rid)
 
@@ -256,7 +288,24 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         except Exception as e:
             logger.error("[FullyAsyncLLMServerManager] Failed to batch remove replicas: %s", e)
-            return 0
+            try:
+                await self._reconcile_hybrid_membership()
+            except Exception as readback_error:
+                logger.error(
+                    "[FullyAsyncLLMServerManager] Failed to read back membership after deactivation failure: %s",
+                    readback_error,
+                )
+                # Make the compensating add target every possibly removed
+                # replica when the authoritative readback is unavailable.
+                for rid in valid_resource_ids:
+                    server_address = self.hybrid_replicas[rid]._server_address
+                    if server_address in self.server_addresses:
+                        index = self.server_addresses.index(server_address)
+                        self.server_addresses.pop(index)
+                        self.server_handles.pop(index)
+                    self.alive_replicas.pop(rid, None)
+                    self.alive_addresses.pop(rid, None)
+            raise
 
     # -------------------------------------------------------------------------
     # Statistics / introspection
@@ -406,7 +455,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
-        self.total_train_steps = None
 
         # Rollouter parameter configuration
         self.message_queue_client = None
@@ -422,6 +470,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.total_train_steps = self._compute_total_train_steps()
         self.concurrent_samples_per_replica: int = config.async_training.get("concurrent_samples_per_replica", 16)
         self.max_required_samples = None
         self.max_concurrent_samples = None
@@ -452,6 +501,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
+        self.pause_reason = None
         self.running = True
 
         # Add dataloader lock
@@ -488,6 +538,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         async with self.lock:
             self.message_queue_client = message_queue_client
 
+    def _compute_total_train_steps(self) -> int:
+        samples_per_sync = self.required_samples * self.config.async_training.trigger_parameter_sync_step
+        return int(self.total_rollout_steps / samples_per_sync)
+
     async def set_max_required_samples(self):
         async with self.lock:
             self.max_required_samples = int(
@@ -495,10 +549,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 * (self.staleness_threshold + 1)
                 * self.config.async_training.trigger_parameter_sync_step
             )
-            self.total_train_steps = int(
-                self.total_rollout_steps
-                / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
-            )
+            self.total_train_steps = self._compute_total_train_steps()
 
             self.max_concurrent_samples = (
                 self.llm_server_manager.get_active_server_count() * self.concurrent_samples_per_replica
@@ -712,6 +763,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.global_steps = (
             trainer_global_steps * self.required_samples * self.config.async_training.trigger_parameter_sync_step + 1
         )
+        maximum_resume_cursor = self.total_rollout_steps + 1
+        if self.global_steps > maximum_resume_cursor:
+            raise RuntimeError(
+                "checkpoint producer cursor exceeds the configured rollout horizon; "
+                f"checkpoint_step={trainer_global_steps}, next_sample={self.global_steps}, "
+                f"rollout_horizon={self.total_rollout_steps}. Refusing to resume against a shortened horizon."
+            )
         print(f"[FullyAsyncRollouter] Setting global_steps to {self.global_steps}")
 
         # Load dataloader state
@@ -858,8 +916,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # Add samples to the pending_queue
     async def _feed_samples(self):
         continuous_iterator = self._create_continuous_iterator()
+        added_samples = 0
 
         for epoch, batch_dict in continuous_iterator:
+            # ``global_steps`` is the one-based index of the next sample to
+            # enqueue.  Check the producer horizon before materializing or
+            # publishing the sample so a boundary resume emits only EOS.
+            if self.global_steps > self.total_rollout_steps:
+                print(
+                    f"[FullyAsyncRollouter][Feed] Producer horizon already complete: "
+                    f"next_sample={self.global_steps}, horizon={self.total_rollout_steps}"
+                )
+                break
+
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
@@ -873,21 +942,25 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
             await self.pending_queue.put(rollout_sample)
+            added_samples += 1
+            emitted_sample_index = self.global_steps
+            self.global_steps += 1
 
             # Check if have reached the last step
-            if self.global_steps >= self.total_rollout_steps:
+            if self.global_steps > self.total_rollout_steps:
                 print(
                     f"[FullyAsyncRollouter][Feed] "
                     f"Maximum count has been reached, stop adding new samples: "
-                    f"{self.global_steps} >= {self.total_rollout_steps}"
+                    f"emitted={emitted_sample_index}, horizon={self.total_rollout_steps}"
                 )
                 break
 
-            self.global_steps += 1
-
         # End signal
         await self.pending_queue.put(None)
-        print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
+        print(
+            f"[FullyAsyncRollouter][Feed] Sample addition is complete, "
+            f"added_samples={added_samples}, producer_index={self.global_steps}"
+        )
 
     def _record_active_count(self):
         """Append current (len(self.active_tasks), max_concurrent_samples) to the history used
@@ -968,14 +1041,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
+                active_tasks = set(self.active_tasks)
+                if not active_tasks:
+                    break
+
+                # reset_staleness() needs the same lock after every weight
+                # update. Waiting for a long-running rollout while holding it
+                # serializes training behind the rollout tail.
+                done_tasks, _pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
                 async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done_tasks:
-                            await task
-                        self._record_active_count()
+                    for task in done_tasks:
+                        self.active_tasks.discard(task)
+                    self._record_active_count()
+                for task in done_tasks:
+                    await task
 
             # Submit single sample processing
             if self.paused:
@@ -1004,12 +1083,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
-        success = await self.message_queue_client.put_sample(
+        min_global_steps = [
+            step for step in rollout_sample.full_batch.non_tensor_batch.get("min_global_steps", []) if step is not None
+        ]
+        max_global_steps = [
+            step for step in rollout_sample.full_batch.non_tensor_batch.get("max_global_steps", []) if step is not None
+        ]
+        receipt = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
+            uid=rollout_sample.sample_id,
+            min_version=min(min_global_steps) if min_global_steps else None,
+            max_version=max(max_global_steps) if max_global_steps else None,
         )
-        if success:
+        if receipt:
             self.total_generated_samples += 1
             self._step_generated_samples += 1
+            if receipt.evicted_uid is not None:
+                self.dropped_stale_samples += 1
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
@@ -1067,8 +1157,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.feed_task = None
             self.processor_task = None
 
-            # Send a finish signal
-            await self.message_queue_client.put_sample(sample=None)
+            # Close out of band so every admitted queue item remains real data.
+            await self.message_queue_client.shutdown()
 
             async with self.lock:
                 self.running = False
@@ -1096,9 +1186,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         try:
             # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            await asyncio.gather(generation_task, monitor_task)
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            raise
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1145,6 +1236,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         queue_size = queue_stats["queue_size"]
 
         if queue_size >= self.max_queue_size:
+            self.pause_reason = "queue_full"
             if not self.paused:
                 print(
                     f"[FullyAsyncRollouter][ShouldPause]  "
@@ -1153,6 +1245,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             return True
 
         if self.staleness_samples >= self.max_required_samples:
+            self.pause_reason = "staleness_budget"
             if not self.paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "
@@ -1161,6 +1254,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
             return True
 
+        self.pause_reason = None
         return False
 
     async def get_statistics(self) -> dict:
@@ -1244,30 +1338,133 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
 
         # Step 2: Abort in-flight requests on all active replicas.
-        active_replicas = self.llm_server_manager.get_replicas()
-        if active_replicas:
-            await asyncio.gather(*[replica.abort_all_requests() for replica in active_replicas])
-            print(f"[FullyAsyncRollouter] Rebalance step 2/4: aborted requests on {len(active_replicas)} replicas")
+        active_replicas = self.llm_server_manager.get_standalone_replicas() + list(
+            self.llm_server_manager.alive_replicas.values()
+        )
 
-        # Step 3: Wait until release_server() from all aborted requests has actually
-        # landed on the load balancer, i.e. _inflight_requests has drained to 0.
-        deadline = time.time() + wait_inflight_timeout_s
-        total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
-        while total_inflight > 0 and time.time() < deadline:
-            await asyncio.sleep(wait_inflight_poll_interval_s)
-            total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
-        if total_inflight > 0:
-            print(
-                f"[FullyAsyncRollouter] Rebalance step 3/4: timed out waiting for in-flight requests to "
-                f"drain, total_inflight={total_inflight} still outstanding after {wait_inflight_timeout_s}s"
-            )
-        else:
-            print("[FullyAsyncRollouter] Rebalance step 3/4: all in-flight requests drained to 0")
+        async def quarantine_replicas() -> None:
+            """Remove faulted replicas from routing and verify the quarantine."""
+            server_ids = list(dict.fromkeys(replica._server_address for replica in active_replicas))
+            quarantined = set(server_ids)
 
-        # Step 4: Resume generation so retried requests can be accepted.
+            # Cut routing first, but an RPC exception can be pre-commit or
+            # post-commit.  Continue with re-abort/local cleanup either way and
+            # use the load balancer's native readback to resolve ambiguity.
+            if server_ids:
+                try:
+                    await self.llm_server_manager.global_load_balancer.remove_servers.remote(server_ids=server_ids)
+                except BaseException as error:
+                    logger.error("Initial quarantine removal failed; resolving by readback: %s", error)
+
+            await asyncio.gather(*[replica.abort_all_requests() for replica in active_replicas], return_exceptions=True)
+
+            for resource_id, replica in list(self.llm_server_manager.alive_replicas.items()):
+                if replica._server_address in quarantined:
+                    self.llm_server_manager.alive_replicas.pop(resource_id, None)
+                    if hasattr(self.llm_server_manager, "alive_addresses"):
+                        self.llm_server_manager.alive_addresses.pop(resource_id, None)
+            if hasattr(self.llm_server_manager, "rollout_replicas"):
+                self.llm_server_manager.rollout_replicas = [
+                    replica
+                    for replica in self.llm_server_manager.rollout_replicas
+                    if replica._server_address not in quarantined
+                ]
+            server_addresses = getattr(self.llm_server_manager, "server_addresses", [])
+            server_handles = getattr(self.llm_server_manager, "server_handles", [])
+            for server_id in server_ids:
+                if server_id in server_addresses:
+                    index = server_addresses.index(server_id)
+                    server_addresses.pop(index)
+                    if index < len(server_handles):
+                        server_handles.pop(index)
+
+            # Removal is idempotent.  At most one compensating retry is needed:
+            # readback distinguishes a committed-but-failed RPC from a true
+            # pre-commit failure and proves that no aborted replica remains
+            # advertised.
+            remaining = set(server_ids)
+            readback_errors: list[BaseException] = []
+            for attempt in range(2):
+                try:
+                    advertised = set(await self.llm_server_manager.global_load_balancer.get_all_servers.remote())
+                    remaining = quarantined.intersection(advertised)
+                except BaseException as error:
+                    readback_errors.append(error)
+                else:
+                    if not remaining:
+                        return
+
+                if attempt == 0 and server_ids:
+                    try:
+                        await self.llm_server_manager.global_load_balancer.remove_servers.remote(
+                            server_ids=list(remaining or quarantined)
+                        )
+                    except BaseException as error:
+                        logger.error("Compensating quarantine removal failed: %s", error)
+
+            detail = f"remaining advertised servers={sorted(remaining)}"
+            if readback_errors:
+                detail += f", readback errors={[str(error) for error in readback_errors]}"
+            raise RuntimeError(f"Could not verify rebalance quarantine: {detail}")
+
+        async def quarantine_and_reraise(error: BaseException) -> None:
+            # Quarantine is a safety action, not ordinary best-effort cleanup.
+            # Run it in a shielded child task and consume any additional
+            # cancellation deliveries before propagating the original
+            # rebalance fault.  ``shield`` prevents the faulted replicas from
+            # remaining advertised merely because the caller was cancelled
+            # while removal/readback was in flight.
+            quarantine_task = asyncio.create_task(quarantine_replicas())
+            try:
+                while not quarantine_task.done():
+                    try:
+                        await asyncio.shield(quarantine_task)
+                    except asyncio.CancelledError:
+                        continue
+                quarantine_task.result()
+            except BaseException as quarantine_error:
+                raise RuntimeError(
+                    f"Rebalance failed with {error!r}; quarantine also failed: {quarantine_error}"
+                ) from error
+            raise error
+
         if active_replicas:
-            await asyncio.gather(*[replica.resume_generation() for replica in active_replicas])
-            print(f"[FullyAsyncRollouter] Rebalance step 4/4: resumed generation on {len(active_replicas)} replicas")
+            try:
+                abort_results = await asyncio.gather(
+                    *[replica.abort_all_requests() for replica in active_replicas], return_exceptions=True
+                )
+                abort_error = next((result for result in abort_results if isinstance(result, BaseException)), None)
+                if abort_error is not None:
+                    raise abort_error
+                print(f"[FullyAsyncRollouter] Rebalance step 2/4: aborted requests on {len(active_replicas)} replicas")
+
+                # Step 3: Wait until release_server() from all aborted requests
+                # has actually landed on the load balancer.
+                deadline = time.time() + wait_inflight_timeout_s
+                total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
+                while total_inflight > 0 and time.time() < deadline:
+                    await asyncio.sleep(wait_inflight_poll_interval_s)
+                    total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
+                if total_inflight > 0:
+                    print(
+                        f"[FullyAsyncRollouter] Rebalance step 3/4: timed out waiting for in-flight requests to "
+                        f"drain, total_inflight={total_inflight} still outstanding after {wait_inflight_timeout_s}s"
+                    )
+                else:
+                    print("[FullyAsyncRollouter] Rebalance step 3/4: all in-flight requests drained to 0")
+
+                # Step 4: Resume generation so retried requests can be accepted.
+                resume_results = await asyncio.gather(
+                    *[replica.resume_generation() for replica in active_replicas], return_exceptions=True
+                )
+                resume_error = next((result for result in resume_results if isinstance(result, BaseException)), None)
+                if resume_error is not None:
+                    raise resume_error
+                print(
+                    f"[FullyAsyncRollouter] Rebalance step 4/4: resumed generation on {len(active_replicas)} replicas"
+                )
+            except BaseException as error:
+                await quarantine_and_reraise(error)
 
         return result
 
@@ -1283,12 +1480,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         if self.max_required_samples is None:
             return
-        new_val = len(self.llm_server_manager.get_replicas()) * self.concurrent_samples_per_replica
+        active_replica_count = self.llm_server_manager.get_active_server_count()
+        new_val = active_replica_count * self.concurrent_samples_per_replica
         new_val = min(new_val, self.max_required_samples)
         print(
             f"[FullyAsyncRollouter] max_concurrent_samples updated: "
             f"{self.max_concurrent_samples} -> {new_val} "
-            f"(active_replicas={len(self.llm_server_manager.get_replicas())})"
+            f"(active_replicas={active_replica_count})"
         )
         self.max_concurrent_samples = new_val
         self._record_active_count()

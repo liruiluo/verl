@@ -110,9 +110,19 @@ class DynamicResourceController:
             print("[DynamicResourceController] No hybrid replicas registered, skipping weight sync")
             return
 
-        await self.hybrid_checkpoint_manager.abort_replicas()
+        try:
+            await self.hybrid_checkpoint_manager.abort_replicas()
+        except Exception:
+            # No weights have been touched yet; restore the prior serving state.
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
+            raise
         await self.hybrid_checkpoint_manager.update_weights(global_steps=global_steps)
-        await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        try:
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        except Exception:
+            # A partial resume after mutation must not leave any replica serving.
+            await self.hybrid_checkpoint_manager.abort_replicas()
+            raise
 
     async def activate_hybrid_replicas(self, global_steps: int) -> None:
         """Add hybrid replicas to the LB and resume generation (weight sync must be done first)."""
@@ -125,8 +135,24 @@ class DynamicResourceController:
             print("[DynamicResourceController] No hybrid replicas found, skipping activation")
             return
 
-        await self.rollouter.add_replicas.remote(hybrid_resource_ids)
-        await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        try:
+            added_replicas = await self.rollouter.add_replicas.remote(hybrid_resource_ids)
+        except Exception:
+            await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+            await self.hybrid_checkpoint_manager.abort_replicas()
+            raise
+        if added_replicas != len(hybrid_resource_ids):
+            await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+            await self.hybrid_checkpoint_manager.abort_replicas()
+            raise RuntimeError(
+                f"Failed to activate all hybrid replicas: added {added_replicas}/{len(hybrid_resource_ids)}"
+            )
+        try:
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        except Exception:
+            await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+            await self.hybrid_checkpoint_manager.abort_replicas()
+            raise
 
         self._hybrid_active = True
         self.activate_count += 1
@@ -148,9 +174,29 @@ class DynamicResourceController:
             return
 
         # Order is critical: remove from LB first so retry loop can't re-route to dying replicas.
-        await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
-        await self.hybrid_checkpoint_manager.abort_replicas()
-        await self.hybrid_checkpoint_manager.sleep_replicas()
+        try:
+            removed_replicas = await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+        except Exception:
+            await self.rollouter.add_replicas.remote(hybrid_resource_ids)
+            raise
+        if removed_replicas != len(hybrid_resource_ids):
+            await self.rollouter.add_replicas.remote(hybrid_resource_ids)
+            raise RuntimeError(
+                f"Failed to deactivate all hybrid replicas: removed {removed_replicas}/{len(hybrid_resource_ids)}"
+            )
+        try:
+            await self.hybrid_checkpoint_manager.abort_replicas()
+        except Exception:
+            await self.rollouter.add_replicas.remote(hybrid_resource_ids)
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
+            raise
+        try:
+            await self.hybrid_checkpoint_manager.sleep_replicas()
+        except Exception:
+            await self.hybrid_checkpoint_manager.wake_up_replicas()
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
+            await self.rollouter.add_replicas.remote(hybrid_resource_ids)
+            raise
 
         self._hybrid_active = False
         self.deactivate_count += 1

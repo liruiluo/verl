@@ -26,6 +26,7 @@ import logging
 import uuid
 from typing import Any
 
+import numpy as np
 import torch
 
 try:
@@ -38,6 +39,25 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
+
+_ZERO_LOSS_BATCH_KEYS = {
+    "advantages",
+    "entropys",
+    "loss_mask",
+    "old_log_probs",
+    "ref_log_prob",
+    "ref_log_probs",
+    "response_mask",
+    "returns",
+    "rm_scores",
+    "routed_experts",
+    "rollout_is_weights",
+    "rollout_log_probs",
+    "sum_pi_squared",
+    "token_level_rewards",
+    "token_level_scores",
+    "values",
+}
 
 
 def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -195,4 +215,160 @@ def upsample_batch_to_divisible_size(
         partition_id=batch.partition_id,
         fields=batch.fields,
         extra_info=batch.extra_info,
+    )
+
+
+def upsample_dataproto_to_divisible_size(
+    batch,
+    batch_multiple: int,
+    eos_token_id: int,
+    uid_group_divisor: int | None = None,
+):
+    """Append synthetic zero-loss rows to a fixed-shape ``DataProto`` batch.
+
+    This is the ``DataProto`` counterpart of
+    :func:`upsample_batch_to_divisible_size`. Fixed-shape batches retain the
+    source row's token layout, while every loss-bearing tensor is zeroed and
+    the non-tensor metadata marks each appended row as synthetic.
+    """
+    from verl.protocol import DataProto
+
+    if not isinstance(batch, DataProto):
+        raise TypeError(f"batch must be a DataProto, got {type(batch)!r}")
+    if isinstance(batch_multiple, bool) or not isinstance(batch_multiple, int) or batch_multiple <= 0:
+        raise ValueError(f"batch_multiple must be a positive integer, got {batch_multiple!r}")
+
+    if uid_group_divisor is not None and (
+        isinstance(uid_group_divisor, bool) or not isinstance(uid_group_divisor, int) or uid_group_divisor <= 0
+    ):
+        raise ValueError(f"uid_group_divisor must be a positive integer, got {uid_group_divisor!r}")
+
+    existing_is_padding = batch.non_tensor_batch.get("is_padding")
+    if existing_is_padding is not None:
+        real_batch = batch.select_idxs(~existing_is_padding.astype(bool))
+    else:
+        real_batch = batch
+    if len(real_batch) == 0:
+        raise ValueError("cannot construct padding without at least one real row")
+
+    real_non_tensor_batch = dict(real_batch.non_tensor_batch)
+    real_non_tensor_batch["is_padding"] = np.zeros(len(real_batch), dtype=bool)
+    real_batch = type(batch)(
+        batch=real_batch.batch,
+        non_tensor_batch=real_non_tensor_batch,
+        meta_info=real_batch.meta_info,
+    )
+
+    remainder = len(real_batch) % batch_multiple
+    if remainder == 0:
+        return real_batch
+
+    pad_size = batch_multiple - remainder
+
+    # PrefixGrouper balances whole UID groups across data-parallel ranks.  If
+    # the real group count is already divisible, adding even one synthetic UID
+    # would make it invalid.  Reuse the first real prefix group in that case;
+    # the synthetic row keeps the exact same prompt but has no response/loss
+    # tokens.  Otherwise create only the number of new groups needed to reach
+    # divisibility.
+    reuse_existing_prefix_group = False
+    padding_uid_group_count = 1
+    if "uid" in real_batch.non_tensor_batch and uid_group_divisor is not None:
+        real_uid_group_count = len(set(real_batch.non_tensor_batch["uid"].tolist()))
+        missing_uid_groups = (-real_uid_group_count) % uid_group_divisor
+        if missing_uid_groups == 0 and pad_size < uid_group_divisor:
+            # There are too few rows to create a complete divisor-sized set of
+            # synthetic groups.  Extend the final real group instead; appending
+            # keeps that UID contiguous for PrefixGrouper.
+            reuse_existing_prefix_group = True
+            padding_uid_group_count = 0
+        elif missing_uid_groups == 0:
+            padding_uid_group_count = uid_group_divisor
+        else:
+            padding_uid_group_count = missing_uid_groups
+            if padding_uid_group_count > pad_size:
+                raise ValueError(
+                    "not enough padding rows to preserve PrefixGrouper group divisibility: "
+                    f"need {padding_uid_group_count}, got {pad_size}"
+                )
+
+    padding_source = real_batch[-1:] if reuse_existing_prefix_group else real_batch[:1]
+    padding = padding_source.repeat(repeat_times=pad_size, interleave=True)
+    if padding.batch is not None:
+        for key in _ZERO_LOSS_BATCH_KEYS.intersection(padding.batch.keys()):
+            padding.batch[key] = torch.zeros_like(padding.batch[key])
+
+        if reuse_existing_prefix_group:
+            # PrefixGrouper identifies shared prompts by UID.  Keep the cloned
+            # real prompt byte-for-byte and mask the entire synthetic suffix.
+            if "responses" in padding.batch:
+                padding.batch["responses"] = torch.full_like(padding.batch["responses"], eos_token_id)
+            if "input_ids" in padding.batch and {"prompts", "responses"}.issubset(padding.batch.keys()):
+                padding.batch["input_ids"] = torch.cat([padding.batch["prompts"], padding.batch["responses"]], dim=-1)
+        else:
+            # Mirror the TransferQueue donor's one-prompt/one-response-token
+            # synthetic sample inside the existing fixed tensor widths.
+            for key in ("prompts", "responses", "input_ids"):
+                if key in padding.batch:
+                    padding.batch[key] = torch.full_like(padding.batch[key], eos_token_id)
+        if "attention_mask" in padding.batch:
+            prompt_width = padding.batch["prompts"].shape[-1]
+            if reuse_existing_prefix_group:
+                attention_mask = padding.batch["attention_mask"].clone()
+                attention_mask[..., prompt_width:] = 0
+            else:
+                attention_mask = torch.zeros_like(padding.batch["attention_mask"])
+                attention_mask[:, prompt_width - 1] = 1
+                attention_mask[:, prompt_width] = 1
+            padding.batch["attention_mask"] = attention_mask
+            if "position_ids" in padding.batch:
+                position_ids = build_padding_position_ids(padding.batch["position_ids"][0], attention_mask[0])
+                padding.batch["position_ids"] = position_ids.unsqueeze(0).repeat(pad_size, *((1,) * position_ids.dim()))
+        if "num_turns" in padding.batch:
+            padding.batch["num_turns"] = torch.zeros_like(padding.batch["num_turns"])
+
+    pad_prefix = f"pad-{uuid.uuid4().hex}"
+    padding.non_tensor_batch["is_padding"] = np.ones(pad_size, dtype=bool)
+    if "multi_modal_inputs" in padding.non_tensor_batch:
+        padding.non_tensor_batch["multi_modal_inputs"] = np.array([{} for _ in range(pad_size)], dtype=object)
+    if "uid" in padding.non_tensor_batch:
+        if reuse_existing_prefix_group:
+            padding.non_tensor_batch["uid"] = np.repeat(real_batch.non_tensor_batch["uid"][-1:], pad_size)
+        else:
+            group_indices = np.arange(pad_size) * padding_uid_group_count // pad_size
+            padding.non_tensor_batch["uid"] = np.array(
+                [f"{pad_prefix}-group-{group_index}" for group_index in group_indices], dtype=object
+            )
+    if "trajectory_uid" in padding.non_tensor_batch:
+        padding.non_tensor_batch["trajectory_uid"] = np.array([pad_prefix] * pad_size, dtype=object)
+    if "trajectory_row_uid" in padding.non_tensor_batch:
+        padding.non_tensor_batch["trajectory_row_uid"] = np.array(
+            [f"{pad_prefix}-row-{index}" for index in range(pad_size)], dtype=object
+        )
+    if "trajectory_row_order" in padding.non_tensor_batch:
+        padding.non_tensor_batch["trajectory_row_order"] = np.arange(pad_size, dtype=object)
+    if "immediate_reward" in padding.non_tensor_batch:
+        padding.non_tensor_batch["immediate_reward"] = np.zeros(pad_size, dtype=object)
+    for key in ("rollout_done_flag", "trajectory_terminal"):
+        if key in padding.non_tensor_batch:
+            padding.non_tensor_batch[key] = np.ones(pad_size, dtype=bool)
+
+    padded_tensor_batch = None
+    if real_batch.batch is not None:
+        padded_tensor_batch = torch.cat([real_batch.batch, padding.batch], dim=0)
+    padded_non_tensor_batch = {
+        key: np.concatenate([value, padding.non_tensor_batch[key]], axis=0)
+        for key, value in real_batch.non_tensor_batch.items()
+    }
+    logger.info(
+        "Upsampled DataProto from %d to %d with %d synthetic padding rows for required_multiple=%d",
+        len(batch),
+        len(real_batch) + pad_size,
+        pad_size,
+        batch_multiple,
+    )
+    return type(batch)(
+        batch=padded_tensor_batch,
+        non_tensor_batch=padded_non_tensor_batch,
+        meta_info=batch.meta_info,
     )

@@ -665,10 +665,25 @@ class AgentLoopWorker:
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        output_groups = await asyncio.gather(*tasks)
+
+        normalized_output_groups = []
+        for output_group in output_groups:
+            outputs = output_group if isinstance(output_group, list) else [output_group]
+            if not outputs:
+                raise ValueError("AgentLoop returned an empty list of outputs")
+            normalized_output_groups.append(outputs)
+
+        outputs = [output for output_group in normalized_output_groups for output in output_group]
+        output_counts = [len(output_group) for output_group in normalized_output_groups]
+        expanded_non_tensor_batch = {
+            key: np.repeat(value, output_counts, axis=0) for key, value in batch.non_tensor_batch.items()
+        }
 
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs,
+            input_non_tensor_batch=expanded_non_tensor_batch,
+            validate=batch.meta_info.get("validate", False),
         )
         return output
 
@@ -680,7 +695,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -704,7 +719,13 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output: AgentLoopOutput | list[AgentLoopOutput] = await agent_loop.run(sampling_params, **kwargs)
+            if isinstance(output, list):
+                if not output:
+                    raise ValueError("AgentLoop returned an empty list of outputs")
+                return await asyncio.gather(
+                    *[self._agent_loop_postprocess(item, trajectory["validate"], **kwargs) for item in output]
+                )
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
