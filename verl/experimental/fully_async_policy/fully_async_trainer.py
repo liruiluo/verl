@@ -740,9 +740,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
+        # Register this micro-step before flushing a completed publication cycle.
+        # The prior ordering flushed/reset the aggregator first, so publication N
+        # logged learner evidence from N-1 and a one-publication run logged none.
+        self._fit_postprocess_step()
         if rollout_reset_timing_raw is not None:
             self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-        self._fit_postprocess_step()
 
     # Timing-raw keys that represent actual training-GPU compute, from
     # _fit_compute_reward() through _fit_update_actor(). Some keys may be

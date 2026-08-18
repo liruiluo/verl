@@ -9,7 +9,7 @@ import json
 import os
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest import TestCase, mock
+from unittest import IsolatedAsyncioTestCase, TestCase, mock
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from tensordict import TensorDict
 
 from verl.experimental.fully_async_policy import fully_async_main as main_module
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
+from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.fully_async_policy.runtime_evidence import compare_parameter_update_probes
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
@@ -362,6 +363,183 @@ class TestBoundedParameterUpdateProbe(TestCase):
         self.assertEqual(critic_worker_group.parameter_update_probe.call_count, 2)
         self.assertEqual(trainer.latest_parameter_update_probe["actor"]["changed_elements"], 1)
         self.assertEqual(trainer.latest_parameter_update_probe["critic"]["changed_elements"], 1)
+
+
+class TestPublicationMetricOrdering(IsolatedAsyncioTestCase):
+    async def test_sync_step_registers_learner_metrics_before_filelogger_flush(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.current_param_version = 0
+        trainer.global_steps = 1
+        trainer.epoch = 0
+        trainer.config = SimpleNamespace(global_profiler=SimpleNamespace(steps=None))
+        trainer.dynamic_resource_controller = None
+        trainer.dynamic_schedule_enabled = False
+
+        batch = object()
+        trainer._fit_start_profile = mock.Mock()
+        trainer._fit_generate = mock.AsyncMock(return_value=batch)
+        for name in (
+            "_fit_compute_reward",
+            "_fit_compute_log_prob",
+            "_fit_compute_ref_log_prob",
+            "_fit_compute_critic",
+            "_fit_compute_advantage",
+            "_fit_update_critic",
+            "_fit_update_actor",
+        ):
+            setattr(trainer, name, mock.Mock(side_effect=lambda value: value))
+
+        def advance_publication() -> None:
+            trainer.current_param_version = 1
+
+        trainer._fit_update_local_step = mock.Mock(side_effect=advance_publication)
+        trainer._fit_update_weights = mock.AsyncMock(
+            return_value={"dynamic_resource/rollout_resource_utilization": 0.5}
+        )
+        trainer._fit_dump_data = mock.Mock()
+        trainer._record_train_resource_utilization = mock.Mock()
+        trainer._fit_validate = mock.AsyncMock()
+        trainer._fit_save_checkpoint = mock.Mock()
+        trainer._fit_stop_profile = mock.Mock()
+
+        def collect_metrics(_batch) -> None:
+            trainer.metrics.update(
+                {
+                    "actor/grad_norm": 1.0,
+                    "critic/grad_norm": 1.0,
+                    "rollout_corr/bypass_real_token_count": 8,
+                    "parameter_update_probe/actor/changed": True,
+                    "parameter_update_probe/critic/changed": True,
+                }
+            )
+
+        trainer._fit_collect_metrics = mock.Mock(side_effect=collect_metrics)
+        events: list[str] = []
+        trainer._fit_postprocess_step = mock.Mock(
+            side_effect=lambda: events.append("register_metrics")
+        )
+
+        def flush_metrics(_timing) -> None:
+            self.assertEqual(events, ["register_metrics"])
+            self.assertIn("actor/grad_norm", trainer.metrics)
+            self.assertIn("critic/grad_norm", trainer.metrics)
+            events.append("flush_filelogger")
+
+        trainer._fit_log_aggregated_training_metrics = mock.Mock(
+            side_effect=flush_metrics
+        )
+
+        await trainer.fit_step()
+
+        self.assertEqual(events, ["register_metrics", "flush_filelogger"])
+
+    @staticmethod
+    def _build_behavioral_trainer(trigger_parameter_sync_step: int):
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.current_param_version = 0
+        trainer.global_steps = 1
+        trainer.local_trigger_step = 1
+        trainer.trigger_parameter_sync_step = trigger_parameter_sync_step
+        trainer.epoch = 0
+        trainer.required_samples = 64
+        trainer.config = SimpleNamespace(global_profiler=SimpleNamespace(steps=None))
+        trainer.dynamic_resource_controller = None
+        trainer.dynamic_schedule_enabled = False
+        trainer.metrics_aggregator = MetricsAggregator(
+            total_gpus=8, hybrid_gpus=4, standalone_gpus=4
+        )
+        trainer.message_queue_client = SimpleNamespace(
+            get_queue_size_sync=mock.Mock(return_value=0)
+        )
+        trainer.progress_bar = mock.Mock()
+        trainer.logger = mock.Mock()
+
+        batch = object()
+        trainer._fit_start_profile = mock.Mock()
+        trainer._fit_generate = mock.AsyncMock(return_value=batch)
+        for name in (
+            "_fit_compute_reward",
+            "_fit_compute_log_prob",
+            "_fit_compute_ref_log_prob",
+            "_fit_compute_critic",
+            "_fit_compute_advantage",
+            "_fit_update_critic",
+            "_fit_update_actor",
+        ):
+            setattr(trainer, name, mock.Mock(side_effect=lambda value: value))
+
+        async def maybe_publish():
+            if trainer.local_trigger_step == 1:
+                return {"dynamic_resource/rollout_resource_utilization": 0.5}
+            return None
+
+        trainer._fit_update_weights = mock.AsyncMock(side_effect=maybe_publish)
+        trainer._fit_dump_data = mock.Mock()
+        trainer._record_train_resource_utilization = mock.Mock()
+        trainer._fit_validate = mock.AsyncMock()
+        trainer._fit_save_checkpoint = mock.Mock()
+        trainer._fit_stop_profile = mock.Mock()
+
+        def collect_metrics(_batch) -> None:
+            step = trainer.global_steps
+            trainer.metrics.update(
+                {
+                    "actor/grad_norm": float(step),
+                    "critic/grad_norm": float(step + 1),
+                    "rollout_corr/bypass_real_token_count": step * 10,
+                    "rollout_corr/bypass_max_abs_diff": 0.0,
+                    "parameter_update_probe/actor/changed": True,
+                    "parameter_update_probe/critic/changed": True,
+                }
+            )
+
+        trainer._fit_collect_metrics = mock.Mock(side_effect=collect_metrics)
+        return trainer
+
+    async def test_cadence_one_flushes_current_microstep_and_resets(self) -> None:
+        trainer = self._build_behavioral_trainer(trigger_parameter_sync_step=1)
+
+        await trainer.fit_step()
+
+        self.assertEqual(trainer.global_steps, 2)
+        self.assertEqual(trainer.current_param_version, 1)
+        self.assertEqual(trainer.local_trigger_step, 1)
+        trainer.logger.log.assert_called_once()
+        payload = trainer.logger.log.call_args.kwargs["data"]
+        self.assertEqual(payload["rollout_corr/bypass_real_token_count"], 10)
+        self.assertEqual(payload["actor/grad_norm"], 1.0)
+        self.assertEqual(trainer.metrics_aggregator.step_count, 0)
+        self.assertEqual(dict(trainer.metrics_aggregator.metric_values), {})
+
+    async def test_cadence_four_sums_token_counts_without_cycle_leakage(self) -> None:
+        trainer = self._build_behavioral_trainer(trigger_parameter_sync_step=4)
+
+        for _ in range(4):
+            await trainer.fit_step()
+
+        self.assertEqual(trainer.global_steps, 5)
+        self.assertEqual(trainer.current_param_version, 1)
+        self.assertEqual(trainer.local_trigger_step, 1)
+        trainer.logger.log.assert_called_once()
+        first = trainer.logger.log.call_args.kwargs["data"]
+        self.assertEqual(first["rollout_corr/bypass_real_token_count"], 100)
+        self.assertEqual(first["actor/grad_norm"], 2.5)
+        self.assertEqual(first["critic/grad_norm"], 3.5)
+        self.assertEqual(trainer.metrics_aggregator.step_count, 0)
+        self.assertEqual(dict(trainer.metrics_aggregator.metric_values), {})
+
+        for _ in range(4):
+            await trainer.fit_step()
+
+        self.assertEqual(trainer.global_steps, 9)
+        self.assertEqual(trainer.current_param_version, 2)
+        self.assertEqual(trainer.logger.log.call_count, 2)
+        second = trainer.logger.log.call_args.kwargs["data"]
+        self.assertEqual(second["rollout_corr/bypass_real_token_count"], 260)
+        self.assertEqual(second["actor/grad_norm"], 6.5)
+        self.assertEqual(second["critic/grad_norm"], 7.5)
+        self.assertEqual(trainer.metrics_aggregator.step_count, 0)
+        self.assertEqual(dict(trainer.metrics_aggregator.metric_values), {})
 
 
 class _RemoteMethod:

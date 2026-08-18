@@ -226,6 +226,9 @@ class MetricsAggregator:
                 # from the summed totals in _special_metrics_aggergate(), not averaged per-micro-step.
                 "dynamic_resource/train_compute_time_s",
                 "dynamic_resource/train_allocated_time_s",
+                # Each local PPO micro-step compares a disjoint set of real policy
+                # tokens; the publication-level evidence must conserve their total.
+                "rollout_corr/bypass_real_token_count",
             ],
         }
 
@@ -393,14 +396,12 @@ class MetricsAggregator:
         #   resource_utilization = ((1 - x) * a * train_resource_utilization
         #                            + (x * a + b) * rollout_resource_utilization) / (a + b)
         #
-        # dynamic_resource/train_resource_utilization is only available once the aggregator
-        # has collected at least one micro-step's dynamic_resource/train_{compute,allocated}_time_s
-        # (see add_step_metrics()/_record_train_resource_utilization()) — this never holds on
-        # the very first sync cycle, since the sync-triggering micro-step's own values are
-        # only recorded *after* this method's caller (_fit_update_weights()) returns. To keep
-        # "dynamic_resource/rollout_resource_utilization" and "dynamic_resource/resource_utilization"
-        # appearing together (rather than the former appearing one cycle earlier), the former is
-        # only added to the output once the latter can also be computed.
+        # dynamic_resource/train_resource_utilization is available once the aggregator has
+        # collected this sync cycle's micro-steps (see add_step_metrics() and
+        # _record_train_resource_utilization()). FullyAsyncTrainer registers the triggering
+        # micro-step before asking for this aggregate, so the first publication is covered too.
+        # Keep rollout_resource_utilization gated on the train ratio so the two utilization
+        # metrics start appearing together.
         total_gpus = self.hybrid_gpus + self.standalone_gpus
         if (
             "dynamic_resource/train_resource_utilization" in aggregated
