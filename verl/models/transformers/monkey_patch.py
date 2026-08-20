@@ -16,7 +16,7 @@ Apply monkey-patch function to models
 """
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Optional
 
 import torch
@@ -278,11 +278,17 @@ def patch_forward_with_backends(
         forward_with_torch_backend_function = forward_with_torch_backend
         forward_with_triton_backend_function = forward_with_triton_backend
 
+    # Fused-kernel selection is a per-model configuration.  Patching the class
+    # leaks the actor's fused forward into colocated models of the same HF class
+    # (for example a non-fused TRL critic), where the fused output intentionally
+    # has no ``logits`` tensor.  Bind the selected implementation to this model
+    # instance so differently configured actor/critic replicas can coexist in
+    # one worker process.
     if fused_kernels_backend == "triton":
-        model.__class__.forward = forward_with_triton_backend_function
+        model.forward = MethodType(forward_with_triton_backend_function, model)
         print(f"Using Triton backend for fused kernels in {model.__class__.__name__}")
     elif fused_kernels_backend == "torch":
-        model.__class__.forward = forward_with_torch_backend_function
+        model.forward = MethodType(forward_with_torch_backend_function, model)
         print(f"Using Torch backend for fused kernels in {model.__class__.__name__}")
     else:
         raise ValueError(f"Unsupported fused_kernels_backend: {fused_kernels_backend}. Choose 'triton' or 'torch'.")
