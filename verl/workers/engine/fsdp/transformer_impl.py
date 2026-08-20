@@ -1113,6 +1113,61 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+def _build_packed_response_predictor_mask(
+    input_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Align policy target masks to causal predictor rows in a packed sequence.
+
+    ``left_right_2_no_padding`` makes ``input_ids`` jagged but deliberately keeps
+    a dense ``response_mask`` at the batch-wide maximum response width. Use the
+    dense full-sequence attention mask to remove each row's response padding
+    before placing that row's policy mask at the tail of its unpadded sequence.
+    A nested response mask already carries its true per-row length.
+    """
+    assert input_ids.is_nested, "input_ids must be a nested tensor"
+
+    if response_mask.is_nested:
+        response_masks = response_mask.unbind()
+    else:
+        if attention_mask is None or attention_mask.is_nested:
+            raise ValueError("a dense response_mask requires a dense attention_mask for packed alignment")
+        if response_mask.ndim != 2 or attention_mask.ndim != 2:
+            raise ValueError(
+                f"response_mask and attention_mask must be rank 2, got {response_mask.shape=} {attention_mask.shape=}"
+            )
+        if response_mask.shape[0] != attention_mask.shape[0]:
+            raise ValueError(
+                "response_mask and attention_mask batch sizes differ: "
+                f"{response_mask.shape[0]} != {attention_mask.shape[0]}"
+            )
+        max_response_len = response_mask.shape[-1]
+        if attention_mask.shape[-1] < max_response_len:
+            raise ValueError(
+                f"attention_mask width {attention_mask.shape[-1]} is shorter than response width {max_response_len}"
+            )
+        response_attention_mask = attention_mask[:, -max_response_len:].bool()
+        response_masks = tuple(
+            mask.masked_select(valid)
+            for mask, valid in zip(response_mask.unbind(), response_attention_mask.unbind(), strict=True)
+        )
+
+    predictor_masks = []
+    for sequence, mask in zip(input_ids.unbind(), response_masks, strict=True):
+        prompt_len = sequence.numel() - mask.numel()
+        if prompt_len < 1:
+            raise ValueError(
+                "packed causal response alignment requires at least one prompt token; "
+                f"got sequence_len={sequence.numel()} response_len={mask.numel()}"
+            )
+        # response_mask marks target tokens. Shift it left by one sequence
+        # position so each true entry selects the row that predicts that target.
+        predictor_masks.append(F.pad(mask, (prompt_len - 1, 1)))
+
+    return torch.cat(predictor_masks).bool().unsqueeze(0)
+
+
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -1180,12 +1235,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
             shift_labels_pad_value = -100 if use_masked_fused_head else 0
 
             if use_masked_fused_head:
-                # response_mask marks targets; shift it left to select their predictor rows.
-                predictor_masks = [
-                    F.pad(mask, (sequence.numel() - mask.numel() - 1, 1))
-                    for sequence, mask in zip(input_ids.unbind(), micro_batch["response_mask"].unbind(), strict=True)
-                ]
-                predictor_mask = torch.cat(predictor_masks).bool().unsqueeze(0)
+                predictor_mask = _build_packed_response_predictor_mask(
+                    input_ids=input_ids,
+                    response_mask=micro_batch["response_mask"],
+                    attention_mask=micro_batch.get("attention_mask"),
+                )
                 shift_labels_rmpad = shift_labels_rmpad.masked_fill(~predictor_mask, -100)
 
             # Optional bucket-aligned packed length. This has to happen after the roll (which must
