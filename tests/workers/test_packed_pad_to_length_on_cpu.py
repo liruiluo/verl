@@ -59,10 +59,12 @@ for _mod in (
     sys.modules.setdefault(_mod, MagicMock())
 
 
+import verl.utils.experimental.torch_functional as fused_ops  # noqa: E402
 from verl.utils.dataset.dataset_utils import DatasetPadMode  # noqa: E402
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead  # noqa: E402
 from verl.workers.engine.utils import pad_packed_inputs  # noqa: E402
 from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead  # noqa: E402
+from verl.workers.utils.padding import left_right_2_no_padding  # noqa: E402
 
 ENGINE_CLASSES = pytest.mark.parametrize(
     "engine_cls",
@@ -227,3 +229,126 @@ def test_fused_head_masks_only_policy_targets(use_fused_kernels, model_type, mas
     expected = (sparse if masked else dense) + [(-100 if masked else 0)] * 3
 
     assert labels.squeeze(0).tolist() == expected
+
+
+def _padded_variable_response_batch():
+    """A real left-padded-prompt/right-padded-response batch with heterogeneous lengths."""
+    # Layout is [max_prompt_len=3 | max_response_len=6]. Prompts are left padded;
+    # responses are right padded. Policy targets may be interleaved with tool/env rows.
+    input_ids = torch.tensor(
+        [
+            [0, 10, 11, 12, 13, 14, 15, 0, 0],
+            [0, 0, 20, 21, 22, 0, 0, 0, 0],
+            [30, 31, 32, 33, 34, 35, 0, 0, 0],
+        ]
+    )
+    attention_mask = torch.tensor(
+        [
+            [0, 1, 1, 1, 1, 1, 1, 0, 0],
+            [0, 0, 1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 0, 0, 0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 0, 1, 1, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ]
+    )
+    position_ids = torch.tensor(
+        [
+            [0, 0, 1, 2, 3, 4, 5, 0, 0],
+            [0, 0, 0, 1, 2, 0, 0, 0, 0],
+            [0, 1, 2, 3, 4, 5, 0, 0, 0],
+        ]
+    )
+    batch = TensorDict(
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+            "position_ids": position_ids,
+        },
+        batch_size=[3],
+    )
+    batch = left_right_2_no_padding(batch)
+    batch.set_non_tensor("temperature", 1.0)
+    batch.set_non_tensor("use_remove_padding", True)
+    batch.set_non_tensor("use_fused_kernels", True)
+    batch.set_non_tensor("pad_mode", DatasetPadMode.NO_PADDING)
+    return batch
+
+
+def test_masked_fused_head_rejects_dense_mask_without_attention_lengths():
+    engine = _make_engine(FSDPEngineWithLMHead, pad_to_length=False)
+    engine.use_ulysses_sp = False
+    engine.pass_packed_cu_seqlens = False
+    engine.model_config = SimpleNamespace(model_type="language_model", fused_kernel_options={"impl_backend": "torch"})
+    batch = _padded_variable_response_batch()
+    del batch["attention_mask"]
+
+    with pytest.raises(ValueError, match="dense response_mask requires a dense attention_mask"):
+        engine.prepare_model_inputs(batch)
+
+
+def test_masked_fused_head_aligns_variable_padded_response_spans(monkeypatch):
+    """Dense max-response masks must be cropped by each row's real response span.
+
+    This is the production layout after ``left_right_2_no_padding``: input ids are
+    jagged, but response masks retain the batch-wide padded response width. A mask
+    width may therefore exceed an entire short sequence and must never be fed to
+    negative ``F.pad`` cropping.
+    """
+    engine = _make_engine(FSDPEngineWithLMHead, pad_to_length=False)
+    engine.use_ulysses_sp = False
+    engine.pass_packed_cu_seqlens = False
+    engine.model_config = SimpleNamespace(model_type="language_model", fused_kernel_options={"impl_backend": "torch"})
+
+    model_inputs, _ = engine.prepare_model_inputs(_padded_variable_response_batch())
+
+    # Packed rows are [10..15], [20..22], [30..35]. Each non-ignored label is
+    # exactly the target token selected by the corresponding policy response mask.
+    assert model_inputs["shift_labels"].squeeze(0).tolist() == [
+        -100,
+        12,
+        -100,
+        14,
+        15,
+        -100,
+        21,
+        22,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+    ]
+
+    # The sparse projection must remain numerically equivalent to a dense
+    # projection whose inactive outputs are masked after projection, including
+    # hidden-state and LM-head gradients and a fully masked episode row.
+    monkeypatch.setattr(fused_ops, "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE", False)
+    labels = model_inputs["shift_labels"]
+    active = labels.ne(-100)
+    torch.manual_seed(0)
+    hidden = torch.randn(1, labels.numel(), 8, requires_grad=True)
+    weight = torch.randn(40, 8, requires_grad=True)
+    log_probs, entropy = fused_ops.FusedLinearForPPO()(hidden, weight, labels, temperature=1.5)
+    (log_probs.sum() + 0.3 * entropy.sum()).backward()
+
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_weight = weight.detach().clone().requires_grad_()
+    ref_log_probs, ref_entropy = fused_ops.FusedLinearForPPOFunction.apply(
+        ref_hidden, ref_weight, labels.masked_fill(~active, 0), 1.5, 512
+    )
+    ref_log_probs = ref_log_probs.masked_fill(~active, 0)
+    ref_entropy = ref_entropy.masked_fill(~active, 0)
+    (ref_log_probs.sum() + 0.3 * ref_entropy.sum()).backward()
+
+    torch.testing.assert_close(log_probs, ref_log_probs)
+    torch.testing.assert_close(entropy, ref_entropy)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad)
+    torch.testing.assert_close(weight.grad, ref_weight.grad)
