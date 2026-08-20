@@ -85,6 +85,19 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _liger_target_model(module, *, model_type: str):
+    """Return the Hugging Face model instance that Liger knows how to patch."""
+
+    if model_type != "value_model":
+        return module
+    pretrained_model = getattr(module, "pretrained_model", None)
+    if pretrained_model is None:
+        raise RuntimeError(
+            "Liger value_model integration requires a pretrained_model wrapper"
+        )
+    return pretrained_model
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -292,7 +305,9 @@ class FSDPEngine(BaseEngine):
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
                 _apply_liger_kernel_to_instance(
-                    model=module,
+                    model=_liger_target_model(
+                        module, model_type=self.model_config.model_type
+                    ),
                     fused_linear_cross_entropy=False,
                     swiglu=True,
                 )
