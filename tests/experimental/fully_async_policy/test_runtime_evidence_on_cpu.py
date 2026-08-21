@@ -320,6 +320,73 @@ class TestBoundedParameterUpdateProbe(TestCase):
         with self.assertRaisesRegex(ValueError, "hard maximum|payload"):
             compare_parameter_update_probes(payload, payload, atol=0.0)
 
+    def test_critic_probe_is_captured_before_value_forward_and_reused_after_update(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.config = SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(n=1)),
+            critic=SimpleNamespace(ppo_mini_batch_size=2),
+        )
+        trainer.use_critic = True
+        trainer.metrics = {}
+        trainer.timing_raw = {}
+        trainer.latest_parameter_update_probe = {}
+        trainer.parameter_update_probe_config = {
+            "enabled": True,
+            "max_parameters": 1,
+            "max_elements_per_parameter": 2,
+            "atol": 0.0,
+            "require_change": True,
+        }
+        events = []
+        critic_worker_group = mock.Mock()
+
+        def capture(*args, **kwargs):
+            del args, kwargs
+            events.append("probe")
+            values = [4.0, 5.0] if events.count("probe") == 1 else [6.0, 5.0]
+            return _probe_payload(values)
+
+        critic_worker_group.parameter_update_probe.side_effect = capture
+        trainer.critic_wg = critic_worker_group
+        batch = DataProto(batch=TensorDict({}, batch_size=2))
+
+        def compute_values(value):
+            del value
+            events.append("values")
+            return DataProto(batch=TensorDict({}, batch_size=2))
+
+        trainer._compute_values = mock.Mock(side_effect=compute_values)
+
+        def update_critic(value):
+            del value
+            events.append("update")
+            return "critic-output"
+
+        with mock.patch.object(SeparateRayPPOTrainer, "_update_critic", side_effect=update_critic):
+            self.assertIsInstance(trainer._fit_compute_critic(batch), DataProto)
+            self.assertEqual(trainer._update_critic(batch), "critic-output")
+
+        self.assertEqual(events, ["probe", "values", "update", "probe"])
+        self.assertEqual(critic_worker_group.parameter_update_probe.call_count, 2)
+        self.assertEqual(trainer.latest_parameter_update_probe["critic"]["changed_elements"], 1)
+        self.assertIsNone(trainer._pending_critic_before_update_probe)
+
+    def test_critic_probe_pending_state_is_cleared_when_value_forward_fails(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.use_critic = True
+        trainer.critic_wg = mock.Mock()
+        trainer._capture_parameter_update_probe = mock.Mock(return_value=_probe_payload([4.0, 5.0]))
+        batch = DataProto(batch=TensorDict({}, batch_size=2))
+
+        with (
+            mock.patch.object(SeparateRayPPOTrainer, "_fit_compute_critic", side_effect=RuntimeError("value failed")),
+            self.assertRaisesRegex(RuntimeError, "value failed"),
+        ):
+            trainer._fit_compute_critic(batch)
+
+        trainer._capture_parameter_update_probe.assert_called_once_with(trainer.critic_wg)
+        self.assertIsNone(trainer._pending_critic_before_update_probe)
+
     def test_actor_and_critic_updates_are_bracketed_by_worker_probes(self) -> None:
         trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
         trainer.config = SimpleNamespace(

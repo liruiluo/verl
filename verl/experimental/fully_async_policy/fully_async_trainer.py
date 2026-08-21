@@ -912,11 +912,33 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             else getattr(rollout_correction, "bypass_mode", False)
         )
 
+    def _fit_compute_critic(self, batch: DataProto) -> DataProto:
+        # Capture the critic before its value-only forward. With FSDP2
+        # ``reshard_after_forward=False``, nested FSDP modules intentionally remain
+        # unsharded after that forward and are resharded after the training
+        # backward. Sampling immediately before ``_update_critic`` would therefore
+        # compare full parameters against local shards instead of comparing the
+        # same parameter coordinates across the optimizer update.
+        self._pending_critic_before_update_probe = None
+        if self.use_critic:
+            critic_worker_group = getattr(self, "critic_wg", None)
+            self._pending_critic_before_update_probe = self._capture_parameter_update_probe(critic_worker_group)
+        try:
+            return super()._fit_compute_critic(batch)
+        except BaseException:
+            self._pending_critic_before_update_probe = None
+            raise
+
     def _update_critic(self, batch: DataProto) -> DataProto:
         critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         self._assert_role_batch_alignment(batch, critic_mini_batch_size, "critic")
         critic_worker_group = getattr(self, "critic_wg", None)
-        before_probe = self._capture_parameter_update_probe(critic_worker_group)
+        before_probe = getattr(self, "_pending_critic_before_update_probe", None)
+        self._pending_critic_before_update_probe = None
+        # Preserve direct-call compatibility for tests and non-standard callers
+        # that do not run the normal value-forward phase first.
+        if before_probe is None:
+            before_probe = self._capture_parameter_update_probe(critic_worker_group)
         output = super()._update_critic(batch)
         if before_probe is not None:
             after_probe = self._capture_parameter_update_probe(critic_worker_group)
