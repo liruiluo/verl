@@ -476,7 +476,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     def _init_models(self):
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
+            self.critic_wg.reset()
+
+            from functools import partial
+
+            from verl.workers.utils.losses import value_loss
+
+            value_loss_ = partial(value_loss, config=self.orig_critic_cfg)
+            self.critic_wg.set_loss_fn(value_loss_)
 
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
