@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import inspect
 import json
 import os
 import uuid
@@ -211,6 +212,47 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    # Fixed-shape fully-async batches may contain synthetic rows solely for
+    # data-parallel / optimizer mini-batch alignment. A zero response mask
+    # makes those rows loss-neutral, but it is not sufficient for estimators
+    # that aggregate across rows before applying the token mask. Run every
+    # estimator on real rows only, then scatter zero advantages and returns
+    # back into the aligned batch.
+    is_padding = data.non_tensor_batch.get("is_padding")
+    if is_padding is not None:
+        is_padding = np.asarray(is_padding, dtype=bool)
+        if is_padding.shape != (len(data),):
+            raise ValueError(
+                "is_padding must contain exactly one boolean per batch row, "
+                f"got shape={is_padding.shape}, batch_size={len(data)}"
+            )
+        if is_padding.all():
+            raise ValueError("cannot compute advantages for an all-padding batch")
+        if is_padding.any():
+            if config is not None and config.get("use_pf_ppo", False):
+                raise NotImplementedError("synthetic aligned padding is not compatible with PF-PPO resampling")
+
+            real_row_mask = ~is_padding
+            real_data = compute_advantage(
+                data.select_idxs(real_row_mask),
+                adv_estimator=adv_estimator,
+                gamma=gamma,
+                lam=lam,
+                num_repeat=num_repeat,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+            for field in ("advantages", "returns"):
+                real_tensor = real_data.batch[field]
+                full_tensor = torch.zeros(
+                    (len(data), *real_tensor.shape[1:]),
+                    dtype=real_tensor.dtype,
+                    device=real_tensor.device,
+                )
+                full_tensor[torch.as_tensor(real_row_mask, device=real_tensor.device)] = real_tensor
+                data.batch[field] = full_tensor
+            return data
+
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
@@ -248,19 +290,48 @@ def compute_advantage(
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
-        adv_kwargs = {
-            "token_level_rewards": data.batch["token_level_rewards"],
-            "response_mask": data.batch["response_mask"],
-            "config": config,
-        }
-        if "uid" in data.non_tensor_batch:  # optional
-            adv_kwargs["index"] = data.non_tensor_batch["uid"]
-        if "reward_baselines" in data.batch:  # optional
-            adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
-        # GDPO: pass raw data for per-dimension reward extraction
-        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
-            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
-            adv_kwargs["batch"] = data.batch
+        parameters = inspect.signature(adv_estimator_fn).parameters
+        keyword_parameter_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+        # Preserve the historical contract for ``**kwargs`` estimators: they
+        # receive the small legacy set rather than every field in the batch.
+        # Explicitly declared parameters are forwarded by name so custom
+        # estimators can consume values and trajectory-row metadata without a
+        # trainer-specific interface.
+        adv_kwargs = (
+            {
+                "token_level_rewards": data.batch["token_level_rewards"],
+                "response_mask": data.batch["response_mask"],
+                "config": config,
+            }
+            if accepts_var_kwargs
+            else {}
+        )
+        if accepts_var_kwargs:
+            if "uid" in data.non_tensor_batch:
+                adv_kwargs["index"] = data.non_tensor_batch["uid"]
+            if "reward_baselines" in data.batch:
+                adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+            if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+                adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+                adv_kwargs["batch"] = data.batch
+
+        for name, parameter in parameters.items():
+            if parameter.kind not in keyword_parameter_kinds:
+                continue
+            if name == "batch":
+                adv_kwargs[name] = data.batch
+            elif name == "non_tensor_batch":
+                adv_kwargs[name] = data.non_tensor_batch
+            elif name == "config":
+                adv_kwargs[name] = config
+            elif name == "index" and "uid" in data.non_tensor_batch:
+                adv_kwargs[name] = data.non_tensor_batch["uid"]
+            elif name in data.batch:
+                adv_kwargs[name] = data.batch[name]
+            elif name in data.non_tensor_batch:
+                adv_kwargs[name] = data.non_tensor_batch[name]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available

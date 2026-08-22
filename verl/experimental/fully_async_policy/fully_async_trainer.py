@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
@@ -34,6 +35,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.padding_utils import upsample_dataproto_to_divisible_size
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -437,11 +439,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # Assemble batch - now working directly with RolloutSample objects
-        if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+        # Assemble first, then align and balance once in _fit_generate. Agent
+        # loops may emit a variable number of train rows per complete episode,
+        # so balancing before zero-loss padding would violate native DP shape
+        # requirements.
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         self._step_wait_times.append(total_wait_time)
@@ -599,9 +601,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
+        # Add the current learner update to the native cycle aggregator before
+        # publishing that cycle.  Upstream previously logged/reset first, which
+        # shifted learner metrics by one publication and dropped the final
+        # update entirely when trigger_parameter_sync_step=1.
+        self._fit_postprocess_step()
         if rollout_reset_timing_raw is not None:
             self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-        self._fit_postprocess_step()
 
     # Timing-raw keys that represent actual training-GPU compute, from
     # _fit_compute_reward() through _fit_update_actor(). Some keys may be
@@ -640,6 +646,105 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.metrics["dynamic_resource/train_compute_time_s"] = train_compute_time
         self.metrics["dynamic_resource/train_allocated_time_s"] = allocated_time
 
+    @staticmethod
+    def _require_native_mini_batch_dp_alignment(*, role: str, mini_batch_size: int, dp_size: int) -> None:
+        """Fail before dispatch when a native global mini-batch cannot split by DP."""
+        if dp_size <= 0:
+            raise ValueError(f"{role} native DP size must be positive, got {dp_size}")
+        if mini_batch_size % dp_size != 0:
+            raise ValueError(
+                f"{role} global mini-batch size {mini_batch_size} must be divisible by native DP size {dp_size}"
+            )
+
+    def _get_required_batch_multiple(self) -> int:
+        """Return one shared mini-batch multiple without changing step counts.
+
+        A single padded batch is consumed by both actor and critic.  Different
+        global mini-batch sizes would require LCM padding and can create extra
+        Adam steps for either role, which is not loss-neutral even when every
+        synthetic response token is masked.  The multi-output fully-async path
+        therefore supports a shared actor/critic mini-batch contract only.
+        """
+
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        actor_active = self.config.trainer.critic_warmup <= self.global_steps
+        active_role_contracts: list[tuple[str, int, int]] = []
+
+        if actor_active:
+            actor_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
+            actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+            self._require_native_mini_batch_dp_alignment(
+                role="actor",
+                mini_batch_size=actor_mini_batch_size,
+                dp_size=actor_dp_size,
+            )
+            active_role_contracts.append(("actor", actor_mini_batch_size, actor_dp_size))
+
+        if self.use_critic:
+            critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * rollout_n
+            critic_dp_size = self._get_dp_size(self.critic_wg, "train")
+            self._require_native_mini_batch_dp_alignment(
+                role="critic",
+                mini_batch_size=critic_mini_batch_size,
+                dp_size=critic_dp_size,
+            )
+            active_role_contracts.append(("critic", critic_mini_batch_size, critic_dp_size))
+
+        if not active_role_contracts:
+            raise ValueError("fully-async learner has no active actor or critic role")
+
+        active_mini_batch_sizes = {mini_batch_size for _, mini_batch_size, _ in active_role_contracts}
+        if len(active_mini_batch_sizes) != 1:
+            details = ", ".join(f"{role}={mini_batch_size}" for role, mini_batch_size, _ in active_role_contracts)
+            raise ValueError(
+                "fully-async multi-output padding requires equal active actor/critic "
+                f"global mini-batch sizes, got {details}"
+            )
+
+        # Each active global mini-batch was checked against its own native DP
+        # size above. Padding only to that shared mini-batch size therefore
+        # preserves ceil(real_rows / mini_batch_size) optimizer steps for every
+        # role; an LCM of different role mini-batches would not.
+        return active_role_contracts[0][1]
+
+    def _validate_synthetic_padding_contract(self, batch: DataProto, batch_multiple: int) -> None:
+        """Reject configurations where zero-mask rows are not optimizer-neutral."""
+
+        if len(batch) % batch_multiple == 0:
+            return
+        actor_active = self.config.trainer.critic_warmup <= self.global_steps
+        if actor_active and self.config.actor_rollout_ref.actor.loss_agg_mode != "token-mean":
+            raise ValueError("fully-async synthetic action-row padding requires actor loss_agg_mode=token-mean")
+        if self.use_critic and self.config.critic.loss_agg_mode != "token-mean":
+            raise ValueError("fully-async synthetic action-row padding requires critic loss_agg_mode=token-mean")
+        if self.config.algorithm.get("use_kl_in_reward", False):
+            raise ValueError("fully-async synthetic action-row padding is incompatible with adaptive in-reward KL")
+
+    def _validate_prefix_group_contract(self, batch: DataProto) -> None:
+        """Fail closed when one prefix-sharing UID contains distinct action states."""
+
+        if not self.use_prefix_grouper or "uid" not in batch.non_tensor_batch:
+            return
+        uid_values = list(batch.non_tensor_batch["uid"])
+        groups: dict[Any, list[int]] = {}
+        for index, uid in enumerate(uid_values):
+            groups.setdefault(uid, []).append(index)
+        if len({len(indices) for indices in groups.values()}) > 1:
+            raise ValueError(
+                "PrefixGrouper requires equal UID-group sizes; variable multi-output action rows are unsupported"
+            )
+        prompts = batch.batch.get("prompts") if batch.batch is not None else None
+        if prompts is None:
+            return
+        for uid, indices in groups.items():
+            if len(indices) <= 1:
+                continue
+            reference = prompts[indices[0]]
+            if any(not reference.equal(prompts[index]) for index in indices[1:]):
+                raise ValueError(
+                    f"PrefixGrouper cannot share one UID across distinct multi-output action prompts: {uid!r}"
+                )
+
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
         timing_raw = self.timing_raw
@@ -648,8 +753,93 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            # Preserve real-token accounting in meta_info. Synthetic rows exist
+            # only to satisfy the learner's fixed-shape contracts.
+            if "attention_mask" in batch.batch:
+                batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(dim=-1).tolist()
+            batch_multiple = self._get_required_batch_multiple()
+            self._validate_synthetic_padding_contract(batch, batch_multiple)
+            self._validate_prefix_group_contract(batch)
+            uid_group_divisor = None
+            if self.config.trainer.balance_batch and self.use_prefix_grouper:
+                uid_group_divisor = self._get_dp_size(self.actor_rollout_wg, "actor")
+            batch = upsample_dataproto_to_divisible_size(
+                batch,
+                batch_multiple=batch_multiple,
+                eos_token_id=self.tokenizer.eos_token_id,
+                uid_group_divisor=uid_group_divisor,
+            )
+            if self.config.trainer.balance_batch:
+                self._balance_batch(batch, metrics={})
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
+
+    @staticmethod
+    def _assert_role_batch_alignment(batch: DataProto, batch_multiple: int, role: str) -> None:
+        """Verify that shared padding satisfies a role's native mini-batch contract."""
+        if len(batch) % batch_multiple != 0:
+            raise RuntimeError(
+                f"shared fully-async batch size {len(batch)} is not divisible by the {role} "
+                f"mini-batch multiple {batch_multiple}; _fit_generate must align the batch once before balancing"
+            )
+
+    def _update_critic(self, batch: DataProto) -> DataProto:
+        critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        self._assert_role_batch_alignment(batch, critic_mini_batch_size, "critic")
+        return super()._update_critic(batch)
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        actor_mini_batch_size = (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        )
+        self._assert_role_batch_alignment(batch, actor_mini_batch_size, "actor")
+        return super()._update_actor(batch)
+
+    @staticmethod
+    def _without_synthetic_padding(batch: DataProto) -> DataProto:
+        is_padding = batch.non_tensor_batch.get("is_padding")
+        if is_padding is None:
+            return batch
+        is_padding = np.asarray(is_padding, dtype=bool)
+        if is_padding.shape != (len(batch),):
+            raise ValueError(
+                "is_padding must contain exactly one boolean per batch row, "
+                f"got shape={is_padding.shape}, batch_size={len(batch)}"
+            )
+        if is_padding.all():
+            raise ValueError("fully-async learner batch cannot contain only synthetic padding")
+        if not is_padding.any():
+            return batch
+        return batch.select_idxs(~is_padding)
+
+    def _fit_dump_data(self, batch: DataProto):
+        real_batch = self._without_synthetic_padding(batch)
+        if real_batch is batch:
+            return super()._fit_dump_data(batch)
+
+        # The parent logger only includes a reward-extra field when its length
+        # matches the dumped batch. Filter row-aligned extras with the same mask
+        # so adding synthetic rows cannot silently drop real rollout evidence.
+        keep_mask = ~np.asarray(batch.non_tensor_batch["is_padding"], dtype=bool)
+        original_reward_extra_infos = self.reward_extra_infos_dict
+        filtered_reward_extra_infos = {}
+        for key, value in original_reward_extra_infos.items():
+            try:
+                is_row_aligned = len(value) == len(batch)
+            except TypeError:
+                is_row_aligned = False
+            filtered_reward_extra_infos[key] = (
+                [item for item, keep in zip(value, keep_mask, strict=True) if keep] if is_row_aligned else value
+            )
+
+        self.reward_extra_infos_dict = filtered_reward_extra_infos
+        try:
+            return super()._fit_dump_data(real_batch)
+        finally:
+            self.reward_extra_infos_dict = original_reward_extra_infos
+
+    def _fit_collect_metrics(self, batch: DataProto) -> None:
+        super()._fit_collect_metrics(self._without_synthetic_padding(batch))
 
     def _compute_old_log_prob(self, batch: DataProto):
         """
