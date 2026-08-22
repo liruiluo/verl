@@ -42,6 +42,17 @@ class _FakeModel:
             self.params[name].copy_(tensor)
 
 
+class _DirectSliceModel:
+    """Mimics SGLang loaders that assign TP shards with ``param.data[slice] = value``."""
+
+    def __init__(self, named: list[tuple[str, torch.Tensor]]):
+        self.params = {n: torch.nn.Parameter(t.clone()) for n, t in named}
+
+    def load_weights(self, chunk):
+        for name, tensor in chunk:
+            self.params[name].data[...] = tensor[...]
+
+
 def _make_named(dtype=torch.bfloat16) -> list[tuple[str, torch.Tensor]]:
     torch.manual_seed(0)
     return [
@@ -113,6 +124,27 @@ def test_masked_apply_bit_identical():
     for name, expected in new_named:
         got = model.params[name]
         assert torch.equal(got.view(torch.int16), expected.view(torch.int16)), f"{name} not bit-identical"
+
+
+def test_masked_apply_preserves_untouched_positions_for_direct_slice_loader():
+    """Qwen3.5's mamba conv loader uses direct slice assignment, not ``copy_``."""
+    named = _make_named()
+    model = _DirectSliceModel(named)
+    sentinel_name = named[0][0]
+    model.params[sentinel_name].data.view(-1)[3] = 42.0
+
+    new_named = []
+    for name, tensor in named:
+        updated = tensor.clone()
+        updated.view(-1)[7] += 1.0
+        new_named.append((name, updated))
+
+    apply_delta(model, _named_tensors(*_sparse_indices_flush(named, new_named)))
+
+    live = model.params[sentinel_name].data.view(-1)
+    assert not torch.isnan(live).any()
+    assert live[3].item() == 42.0
+    assert live[7] == new_named[0][1].view(-1)[7]
 
 
 def test_untouched_positions_preserved():
@@ -215,6 +247,18 @@ def test_verify_sweep_passes_on_identical_state():
     named = _make_named()
     model = _FakeModel([(n, t.clone()) for n, t in named])
     apply_delta(model, _dense_verify_flush(named))  # must not raise
+
+
+def test_verify_sweep_checks_direct_slice_loader_destinations():
+    """Dense verification must observe model loaders that bypass ``copy_``."""
+    import pytest
+
+    named = _make_named()
+    diverged = [(name, tensor.clone()) for name, tensor in named]
+    diverged[0][1].view(-1)[3] += 1.0
+    model = _DirectSliceModel(diverged)
+    with pytest.raises(RuntimeError, match="verification FAILED"):
+        apply_delta(model, _dense_verify_flush(named))
 
 
 def test_verify_sweep_fails_loud_on_divergence():

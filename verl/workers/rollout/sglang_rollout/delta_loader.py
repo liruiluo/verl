@@ -132,22 +132,39 @@ def _verify_dense(model: torch.nn.Module, params: list[dict], values: torch.Tens
     Comparing per copy_ call instead would false-positive on every
     transform-loaded param (raw-vs-transformed at each stage)."""
     orig_copy = torch.Tensor.copy_
+    orig_setitem = torch.Tensor.__setitem__
 
     by_param = _VERIFY_STATS.setdefault("by_param", {})
     for p in params:
         touched: dict = {}
 
-        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, _touched=touched, **kwargs) -> torch.Tensor:
-            key = (self.data_ptr(), self.numel(), self.dtype)
-            if key not in _touched:
-                _touched[key] = (self, self.detach().clone())
+        def snapshot(destination: torch.Tensor) -> None:
+            key = (
+                destination.data_ptr(),
+                tuple(destination.shape),
+                tuple(destination.stride()),
+                destination.dtype,
+            )
+            if key not in touched:
+                touched[key] = (destination, destination.detach().clone())
+
+        def snap_then_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+            snapshot(self)
             return orig_copy(self, src, *args, **kwargs)
 
+        def snap_then_setitem_(self: torch.Tensor, key, value) -> None:
+            destination = self[key]
+            if isinstance(destination, torch.Tensor):
+                snapshot(destination)
+            return orig_setitem(self, key, value)
+
         torch.Tensor.copy_ = snap_then_copy_
+        torch.Tensor.__setitem__ = snap_then_setitem_
         try:
             _apply_dense(model, [p], values)
         finally:
             torch.Tensor.copy_ = orig_copy
+            torch.Tensor.__setitem__ = orig_setitem
         bad = 0
         for dst, pre in touched.values():
             if dst.is_floating_point() and dst.element_size() == 2:
@@ -209,6 +226,13 @@ def _masked_copy() -> Iterator[None]:
     full-seed flush) take the original fast path untouched.
     """
     orig_copy = torch.Tensor.copy_
+    orig_setitem = torch.Tensor.__setitem__
+
+    def merge_masked(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor | None:
+        if not source.is_floating_point() or destination.shape != source.shape:
+            return None
+        cast = source.to(destination.dtype)
+        return torch.where(torch.isnan(cast), destination, cast)
 
     def masked_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         # Sync-free masked overwrite: boolean advanced indexing (and a
@@ -216,13 +240,29 @@ def _masked_copy() -> Iterator[None]:
         # parameter -- ruinous for MoE flushes carrying >10k per-expert
         # entries. ``torch.where`` keeps everything on-stream; a NaN-free
         # (dense) source degenerates to a plain copy.
-        if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
-            cast = src.to(self.dtype)
-            return orig_copy(self, torch.where(torch.isnan(cast), self, cast))
+        if isinstance(src, torch.Tensor):
+            merged = merge_masked(self, src)
+            if merged is not None:
+                return orig_copy(self, merged, *args, **kwargs)
         return orig_copy(self, src, *args, **kwargs)
 
+    def masked_setitem_(self: torch.Tensor, key, value) -> None:
+        # Some SGLang model-specific loaders bypass ``copy_`` and assign TP
+        # slices directly (Qwen3.5's mamba conv loader is one example).  The
+        # sparse source still contains NaN sentinels, so mask against the exact
+        # destination slice before invoking the original assignment.
+        if isinstance(value, torch.Tensor):
+            destination = self[key]
+            if isinstance(destination, torch.Tensor):
+                merged = merge_masked(destination, value)
+                if merged is not None:
+                    return orig_setitem(self, key, merged)
+        return orig_setitem(self, key, value)
+
     torch.Tensor.copy_ = masked_copy_
+    torch.Tensor.__setitem__ = masked_setitem_
     try:
         yield
     finally:
         torch.Tensor.copy_ = orig_copy
+        torch.Tensor.__setitem__ = orig_setitem
