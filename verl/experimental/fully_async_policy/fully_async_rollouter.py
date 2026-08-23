@@ -433,10 +433,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.processed_sample_count = 0
+        self.rollout_dispatched_samples = 0
+        self.rollout_inflight_samples = 0
         self.rollout_completed_samples = 0
         self.rollout_failed_samples = 0
+        self.rollout_cancelled_samples = 0
+        self.rollout_dispatched_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_inflight_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_completed_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_failed_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_cancelled_by_data_source: collections.Counter[str] = collections.Counter()
         # Kept as a compatibility metric. Queue overflow is not a stale-policy
         # rejection and is accounted separately below.
         self.dropped_stale_samples = 0
@@ -1004,6 +1010,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
                 self._record_active_count()
 
+    def _record_rollout_dispatch(self, data_source: str) -> None:
+        self.rollout_dispatched_samples += 1
+        self.rollout_inflight_samples += 1
+        self.rollout_dispatched_by_data_source[data_source] += 1
+        self.rollout_inflight_by_data_source[data_source] += 1
+
+    def _record_rollout_terminal(self, data_source: str, outcome: str) -> None:
+        if outcome not in {"completed", "failed", "cancelled"}:
+            raise ValueError(f"unknown fully-async rollout outcome: {outcome}")
+        if self.rollout_inflight_samples <= 0 or self.rollout_inflight_by_data_source[data_source] <= 0:
+            raise RuntimeError("fully-async rollout terminal event has no matching dispatch")
+
+        total_attr = f"rollout_{outcome}_samples"
+        route_attr = f"rollout_{outcome}_by_data_source"
+        setattr(self, total_attr, getattr(self, total_attr) + 1)
+        route_counter = getattr(self, route_attr)
+        route_counter[data_source] += 1
+        self.rollout_inflight_samples -= 1
+        self.rollout_inflight_by_data_source[data_source] -= 1
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
@@ -1011,7 +1037,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        data_source = rollout_sample.sample_metadata.get("data_source")
+        data_source = str(rollout_sample.sample_metadata.get("data_source") or "__unlabeled__")
+        self._record_rollout_dispatch(data_source)
         try:
             ret = await self.async_rollout_manager.generate_sequences_single(
                 rollout_sample.full_batch
@@ -1023,19 +1050,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
             rollout_sample.rollout_status = await self.get_statistics()
-        except Exception:
-            self.rollout_failed_samples += 1
-            if data_source is not None:
-                self.rollout_failed_by_data_source[data_source] += 1
+            enqueued_without_eviction = await self.message_queue_client.put_sample(
+                sample=ray.cloudpickle.dumps(rollout_sample),
+                data_source=data_source,
+            )
+        except asyncio.CancelledError:
+            self._record_rollout_terminal(data_source, "cancelled")
             raise
+        except BaseException:
+            self._record_rollout_terminal(data_source, "failed")
+            raise
+        else:
+            self._record_rollout_terminal(data_source, "completed")
 
-        self.rollout_completed_samples += 1
-        if data_source is not None:
-            self.rollout_completed_by_data_source[data_source] += 1
-        enqueued_without_eviction = await self.message_queue_client.put_sample(
-            sample=ray.cloudpickle.dumps(rollout_sample),
-            data_source=data_source,
-        )
         # The current sample is always enqueued. A False result reports that the
         # bounded queue evicted an older sample to make room.
         self.total_generated_samples += 1
@@ -1142,10 +1169,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
-            # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-        except Exception as e:
-            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            # Propagate either child failure to the task runner. The finally
+            # block still joins both children before the owner call terminates.
+            await asyncio.gather(generation_task, monitor_task)
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1220,8 +1246,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # cumulative event accounting
             "count/total_generated_samples": self.total_generated_samples,
+            "count/rollout_dispatched_samples": self.rollout_dispatched_samples,
+            "count/rollout_inflight_samples": self.rollout_inflight_samples,
             "count/rollout_completed_samples": self.rollout_completed_samples,
             "count/rollout_failed_samples": self.rollout_failed_samples,
+            "count/rollout_cancelled_samples": self.rollout_cancelled_samples,
             "count/queue_enqueued_samples": queue_stats["total_produced"],
             "count/queue_dequeued_samples": queue_stats["total_consumed"],
             "count/queue_overflow_evictions": queue_stats["dropped_samples"],
@@ -1237,8 +1266,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
         labeled_counters = {
+            "rollout_dispatched": self.rollout_dispatched_by_data_source,
+            "rollout_inflight": self.rollout_inflight_by_data_source,
             "rollout_completed": self.rollout_completed_by_data_source,
             "rollout_failed": self.rollout_failed_by_data_source,
+            "rollout_cancelled": self.rollout_cancelled_by_data_source,
             "queue_enqueued": queue_stats["enqueued_by_data_source"],
             "queue_dequeued": queue_stats["consumed_by_data_source"],
             "queue_overflow_evicted": queue_stats["evicted_by_data_source"],

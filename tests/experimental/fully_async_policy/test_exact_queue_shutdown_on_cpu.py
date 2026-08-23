@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+from collections import Counter
 from types import MethodType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase, mock
 from unittest.mock import patch
@@ -17,7 +18,6 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl import DataProto
-
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     RolloutSample,
@@ -31,7 +31,6 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     TrainingStopException,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueue
-
 
 FORMAL_EPISODES = 25_600
 EPISODES_PER_UPDATE = 64
@@ -128,6 +127,15 @@ class _RecordingQueueClient:
         self.closed = True
 
 
+class _RouteRecordingQueueClient:
+    def __init__(self):
+        self.samples = []
+
+    async def put_sample(self, sample, data_source=None):
+        self.samples.append((sample, data_source))
+        return True
+
+
 class _FiniteQueueClient:
     def __init__(self, samples):
         self.samples = list(samples)
@@ -194,6 +202,9 @@ class TestMessageQueueShutdown(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "shut down"):
             await queue.put_sample(b"orphan")
 
+        with self.assertRaisesRegex(RuntimeError, "shut down"):
+            await queue.put_sample(None)
+
 
 class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
     async def test_trainer_accepts_native_shutdown_none_without_unpacking(self) -> None:
@@ -243,7 +254,7 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
         self.assertTrue(batch.meta_info["fully_async/final_partial_batch"])
         self.assertEqual(batch.meta_info["fully_async/real_episode_count"], 2)
 
-    async def test_fit_lifecycle_consumes_exactly_400_complete_batches(self) -> None:
+    async def test_collection_handoff_accounts_for_400_complete_batches(self) -> None:
         queue_cls = _local_actor_class(MessageQueue)
         queue = queue_cls(OmegaConf.create({}), max_queue_size=FORMAL_EPISODES)
         with patch("builtins.print"):
@@ -264,13 +275,13 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
             trainer.current_param_version = 0
             trainer.local_trigger_step = 1
             trainer.progress_bar = SimpleNamespace(close=lambda: None)
-            trainer.optimizer_updates = 0
+            trainer.collection_handoffs = 0
 
             async def _fit_step(self, batch_dict=None):
                 _epoch, batch = await self._get_samples_from_queue()
                 if batch is None:
                     raise TrainingStopException
-                self.optimizer_updates += 1
+                self.collection_handoffs += 1
                 self.current_param_version += 1
 
             trainer.fit_step = MethodType(_fit_step, trainer)
@@ -283,9 +294,170 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
                 await trainer.fit()
 
         stats = await queue.get_statistics()
-        self.assertEqual(trainer.optimizer_updates, 400)
+        self.assertEqual(trainer.collection_handoffs, 400)
         self.assertEqual(stats["total_consumed"], FORMAL_EPISODES)
         self.assertEqual(stats["queue_size"], 0)
+
+    async def test_fit_step_accounts_only_after_critic_and_actor_succeed(self) -> None:
+        async def run_fit_step(failing_update=None):
+            trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+            trainer.config = OmegaConf.create({"global_profiler": {"steps": None}})
+            trainer.global_steps = 1
+            trainer.epoch = 0
+            trainer.current_param_version = 0
+            trainer.dynamic_schedule_enabled = False
+            trainer.dynamic_resource_controller = None
+            events = []
+            batch = object()
+
+            async def _fit_generate(self, _batch):
+                return batch
+
+            def _passthrough(self, value):
+                return value
+
+            def _update_critic(self, value):
+                events.append("critic")
+                if failing_update == "critic":
+                    raise RuntimeError("critic update failed")
+                return value
+
+            def _update_actor(self, value):
+                events.append("actor")
+                if failing_update == "actor":
+                    raise RuntimeError("actor update failed")
+                return value
+
+            def _record_optimizer_consumption(self, value):
+                if value is not batch:
+                    raise AssertionError("learner accounting received a different batch")
+                events.append("accounting")
+
+            async def _fit_update_weights(self):
+                return None
+
+            async def _fit_validate(self):
+                return None
+
+            trainer._fit_generate = MethodType(_fit_generate, trainer)
+            trainer._fit_compute_reward = MethodType(_passthrough, trainer)
+            trainer._fit_compute_log_prob = MethodType(_passthrough, trainer)
+            trainer._fit_compute_ref_log_prob = MethodType(_passthrough, trainer)
+            trainer._fit_compute_critic = MethodType(_passthrough, trainer)
+            trainer._fit_compute_advantage = MethodType(_passthrough, trainer)
+            trainer._fit_update_critic = MethodType(_update_critic, trainer)
+            trainer._fit_update_actor = MethodType(_update_actor, trainer)
+            trainer._record_optimizer_consumption = MethodType(
+                _record_optimizer_consumption, trainer
+            )
+            trainer._fit_update_local_step = MethodType(lambda self: None, trainer)
+            trainer._fit_update_weights = MethodType(_fit_update_weights, trainer)
+            trainer._fit_dump_data = MethodType(lambda self, value: None, trainer)
+            trainer._record_train_resource_utilization = MethodType(
+                lambda self, allocated_time: None, trainer
+            )
+            trainer._fit_validate = MethodType(_fit_validate, trainer)
+            trainer._fit_save_checkpoint = MethodType(lambda self: None, trainer)
+            trainer._fit_start_profile = MethodType(
+                lambda self, should_profiler: None, trainer
+            )
+            trainer._fit_stop_profile = MethodType(
+                lambda self, should_profiler: None, trainer
+            )
+            trainer._fit_collect_metrics = MethodType(lambda self, value: None, trainer)
+            trainer._fit_postprocess_step = MethodType(lambda self: None, trainer)
+
+            if failing_update is None:
+                await trainer.fit_step()
+            else:
+                with self.assertRaisesRegex(
+                    RuntimeError, f"{failing_update} update failed"
+                ):
+                    await trainer.fit_step()
+            return events
+
+        self.assertEqual(await run_fit_step(), ["critic", "actor", "accounting"])
+        self.assertEqual(await run_fit_step("critic"), ["critic"])
+        self.assertEqual(await run_fit_step("actor"), ["critic", "actor"])
+
+    async def test_rollout_route_lifecycle_has_one_terminal_outcome(self) -> None:
+        async def get_statistics(self):
+            return {}
+
+        def make_rollouter(generate_sequences_single):
+            rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+            rollouter.async_rollout_manager = SimpleNamespace(
+                generate_sequences_single=generate_sequences_single
+            )
+            rollouter.message_queue_client = _RouteRecordingQueueClient()
+            rollouter.get_statistics = MethodType(get_statistics, rollouter)
+            rollouter.total_generated_samples = 0
+            rollouter._step_generated_samples = 0
+            rollouter.processed_sample_count = 0
+            rollouter.rollout_dispatched_samples = 0
+            rollouter.rollout_inflight_samples = 0
+            rollouter.rollout_completed_samples = 0
+            rollouter.rollout_failed_samples = 0
+            rollouter.rollout_cancelled_samples = 0
+            rollouter.rollout_dispatched_by_data_source = Counter()
+            rollouter.rollout_inflight_by_data_source = Counter()
+            rollouter.rollout_completed_by_data_source = Counter()
+            rollouter.rollout_failed_by_data_source = Counter()
+            rollouter.rollout_cancelled_by_data_source = Counter()
+            return rollouter
+
+        async def succeed(batch):
+            return batch
+
+        success = make_rollouter(succeed)
+        await success._process_single_sample_streaming(
+            _rollout_sample("route-a", [[1]], "success")
+        )
+        self.assertEqual(success.rollout_dispatched_samples, 1)
+        self.assertEqual(success.rollout_completed_samples, 1)
+        self.assertEqual(success.rollout_failed_samples, 0)
+        self.assertEqual(success.rollout_cancelled_samples, 0)
+        self.assertEqual(success.rollout_inflight_samples, 0)
+        self.assertEqual(success.rollout_inflight_by_data_source["route-a"], 0)
+
+        async def fail(_batch):
+            raise RuntimeError("generation failed")
+
+        failure = make_rollouter(fail)
+        with self.assertRaisesRegex(RuntimeError, "generation failed"):
+            await failure._process_single_sample_streaming(
+                _rollout_sample("route-b", [[1]], "failure")
+            )
+        self.assertEqual(failure.rollout_dispatched_samples, 1)
+        self.assertEqual(failure.rollout_completed_samples, 0)
+        self.assertEqual(failure.rollout_failed_samples, 1)
+        self.assertEqual(failure.rollout_cancelled_samples, 0)
+        self.assertEqual(failure.rollout_inflight_samples, 0)
+        self.assertEqual(failure.rollout_inflight_by_data_source["route-b"], 0)
+
+        started = asyncio.Event()
+
+        async def block(_batch):
+            started.set()
+            await asyncio.Event().wait()
+
+        cancelled = make_rollouter(block)
+        task = asyncio.create_task(
+            cancelled._process_single_sample_streaming(
+                _rollout_sample("route-c", [[1]], "cancelled")
+            )
+        )
+        await started.wait()
+        self.assertEqual(cancelled.rollout_inflight_by_data_source["route-c"], 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(cancelled.rollout_dispatched_samples, 1)
+        self.assertEqual(cancelled.rollout_completed_samples, 0)
+        self.assertEqual(cancelled.rollout_failed_samples, 0)
+        self.assertEqual(cancelled.rollout_cancelled_samples, 1)
+        self.assertEqual(cancelled.rollout_inflight_samples, 0)
+        self.assertEqual(cancelled.rollout_inflight_by_data_source["route-c"], 0)
 
     async def test_rollouter_quiesces_inflight_producers_before_shutdown(self) -> None:
         rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
@@ -359,6 +531,39 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
         self.assertEqual(queue_client.shutdown_calls, 1)
         self.assertEqual(queue_client.samples, [])
         self.assertFalse(rollouter.running)
+
+    async def test_rollouter_fit_propagates_streaming_failure_after_cleanup(self) -> None:
+        rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+        monitor_cancelled = asyncio.Event()
+
+        async def _failed_generation(self):
+            await asyncio.sleep(0)
+            raise RuntimeError("streaming failed")
+
+        async def _monitor(self):
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                monitor_cancelled.set()
+                raise
+
+        rollouter.message_queue_client = object()
+        rollouter.lock = asyncio.Lock()
+        rollouter._resume_event = asyncio.Event()
+        rollouter._streaming_generation_main = MethodType(_failed_generation, rollouter)
+        rollouter._async_monitor_loop = MethodType(_monitor, rollouter)
+
+        with (
+            patch(
+                "verl.experimental.fully_async_policy.fully_async_rollouter.safe_create_task",
+                side_effect=lambda coro, name: asyncio.create_task(coro, name=name),
+            ),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "streaming failed"):
+                await rollouter.fit()
+
+        self.assertTrue(monitor_cancelled.is_set())
 
 
 class TestSampleMetadata(TestCase):
@@ -476,10 +681,16 @@ class TestQueueDataSourceAccounting(IsolatedAsyncioTestCase):
         rollouter.active_tasks = set()
         rollouter.pending_queue = asyncio.Queue()
         rollouter.total_generated_samples = 7
+        rollouter.rollout_dispatched_samples = 10
+        rollouter.rollout_inflight_samples = 1
         rollouter.rollout_completed_samples = 7
         rollouter.rollout_failed_samples = 1
+        rollouter.rollout_cancelled_samples = 1
+        rollouter.rollout_dispatched_by_data_source = {"fast": 6, "slow": 4}
+        rollouter.rollout_inflight_by_data_source = {"fast": 0, "slow": 1}
         rollouter.rollout_completed_by_data_source = {"fast": 5, "slow": 2}
-        rollouter.rollout_failed_by_data_source = {"slow": 1}
+        rollouter.rollout_failed_by_data_source = {"fast": 1}
+        rollouter.rollout_cancelled_by_data_source = {"slow": 1}
         rollouter.queue_overflow_evictions = 1
         rollouter.staleness_samples = 2
         rollouter.dropped_stale_samples = 0
@@ -491,8 +702,21 @@ class TestQueueDataSourceAccounting(IsolatedAsyncioTestCase):
 
         stats = await rollouter.get_statistics()
 
+        self.assertEqual(stats["count/rollout_dispatched/data_source/fast"], 6)
+        self.assertEqual(stats["count/rollout_inflight/data_source/slow"], 1)
         self.assertEqual(stats["count/rollout_completed/data_source/fast"], 5)
-        self.assertEqual(stats["count/rollout_failed/data_source/slow"], 1)
+        self.assertEqual(stats["count/rollout_failed/data_source/fast"], 1)
+        self.assertEqual(stats["count/rollout_cancelled/data_source/slow"], 1)
+        self.assertEqual(stats["count/rollout_dispatched_samples"], 10)
+        self.assertEqual(stats["count/rollout_inflight_samples"], 1)
+        self.assertEqual(stats["count/rollout_cancelled_samples"], 1)
+        self.assertEqual(
+            stats["count/rollout_dispatched_samples"],
+            stats["count/rollout_inflight_samples"]
+            + stats["count/rollout_completed_samples"]
+            + stats["count/rollout_failed_samples"]
+            + stats["count/rollout_cancelled_samples"],
+        )
         self.assertEqual(stats["count/queue_enqueued/data_source/slow"], 2)
         self.assertEqual(stats["count/queue_dequeued/data_source/fast"], 3)
         self.assertEqual(stats["count/queue_overflow_evicted/data_source/slow"], 1)
@@ -560,6 +784,41 @@ class TestQueueDataSourceAccounting(IsolatedAsyncioTestCase):
         self.assertEqual(trainer.metrics["fully_async/sum/optimizer_consumed_action_rows"], 6)
         self.assertEqual(
             trainer.metrics["fully_async/sum/optimizer_consumed_policy_response_tokens"], 8
+        )
+
+    async def test_stale_rows_expand_retained_episode_routes_without_output_labels(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.current_param_version = 7
+        trainer.stale_trajectory_processed = 0
+        trainer.stale_action_rows_by_data_source = Counter()
+        batch = DataProto(
+            batch=TensorDict(
+                {"response_mask": torch.ones((3, 1), dtype=torch.long)},
+                batch_size=3,
+            ),
+            non_tensor_batch={
+                "max_global_steps": np.array([6, 6, 7], dtype=np.int64)
+            },
+            meta_info={
+                "fully_async/sample_metadata": [
+                    {"data_source": "route-a", "real_action_rows": 2},
+                    {"data_source": "route-b", "real_action_rows": 1},
+                ]
+            },
+        )
+        metrics = {}
+
+        trainer._collect_metrics_from_samples(batch, metrics)
+
+        self.assertEqual(trainer.stale_trajectory_processed, 2)
+        self.assertEqual(
+            dict(trainer.stale_action_rows_by_data_source), {"route-a": 2}
+        )
+        self.assertEqual(
+            metrics["fully_async/count/stale_action_rows/data_source/route-a"], 2
+        )
+        self.assertNotIn(
+            "fully_async/count/stale_action_rows/data_source/__unlabeled__", metrics
         )
 
     async def test_partial_tail_excludes_synthetic_padding_from_consumption(self) -> None:
@@ -708,6 +967,104 @@ class TestFinalStatistics(TestCase):
         self.assertEqual(events[1:], ["queue_stats", "rollouter_stats", "trainer_stats"])
         self.assertEqual(statistics["queue_cleanup"], {"status": "completed"})
         self.assertEqual(statistics["queue"]["total_cleared"], 2)
+
+    def test_component_failure_joins_cancelled_owner_before_finalizing(self) -> None:
+        failed_ref = object()
+        live_ref = object()
+        events = []
+        runner = object.__new__(_local_actor_class(FullyAsyncTaskRunner))
+        runner.components = {
+            "rollouter": SimpleNamespace(fit=_ImmediateRemoteMethod(live_ref)),
+            "trainer": SimpleNamespace(fit=_ImmediateRemoteMethod(failed_ref)),
+        }
+
+        def wait(values, num_returns, timeout):
+            if timeout is None:
+                events.append("monitor")
+                return [failed_ref], [live_ref]
+            events.append("join")
+            self.assertEqual(values, [live_ref])
+            self.assertEqual(num_returns, 1)
+            self.assertEqual(timeout, 30.0)
+            return [live_ref], []
+
+        def get(value, *args, **kwargs):
+            if value is failed_ref:
+                events.append("failure")
+                raise RuntimeError("component failed")
+            if value is live_ref:
+                events.append("joined")
+            return value
+
+        def cancel(value):
+            self.assertIs(value, live_ref)
+            events.append("cancel")
+
+        with (
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.wait",
+                side_effect=wait,
+            ),
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.get",
+                side_effect=get,
+            ),
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.cancel",
+                side_effect=cancel,
+            ),
+            mock.patch.object(
+                runner,
+                "_finalize_statistics",
+                side_effect=lambda: events.append("finalize") or {},
+            ),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "component failed"):
+                runner._run_training_loop()
+
+        self.assertEqual(
+            events, ["monitor", "failure", "cancel", "join", "joined", "finalize"]
+        )
+
+    def test_component_failure_skips_finalization_when_owner_does_not_quiesce(self) -> None:
+        failed_ref = object()
+        live_ref = object()
+        runner = object.__new__(_local_actor_class(FullyAsyncTaskRunner))
+        runner.components = {
+            "rollouter": SimpleNamespace(fit=_ImmediateRemoteMethod(live_ref)),
+            "trainer": SimpleNamespace(fit=_ImmediateRemoteMethod(failed_ref)),
+        }
+
+        def wait(values, num_returns, timeout):
+            if timeout is None:
+                return [failed_ref], [live_ref]
+            return [], [live_ref]
+
+        def get(value, *args, **kwargs):
+            if value is failed_ref:
+                raise RuntimeError("component failed")
+            return value
+
+        with (
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.wait",
+                side_effect=wait,
+            ),
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.get",
+                side_effect=get,
+            ),
+            mock.patch(
+                "verl.experimental.fully_async_policy.fully_async_main.ray.cancel"
+            ),
+            mock.patch.object(runner, "_finalize_statistics") as finalize,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not quiesce"):
+                runner._run_training_loop()
+
+        finalize.assert_not_called()
 
 
 class TestCumulativeMetricAggregation(TestCase):

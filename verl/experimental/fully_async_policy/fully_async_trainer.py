@@ -1348,12 +1348,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if hasattr(batch, "meta_info") and batch.meta_info:
             real_batch = self._without_synthetic_padding(batch)
             trajectory_param_versions = real_batch.non_tensor_batch["max_global_steps"]
-            data_sources = real_batch.non_tensor_batch.get("data_source")
-            if data_sources is None:
-                data_sources = np.array(["__unlabeled__"] * len(real_batch), dtype=object)
+            sample_metadata = batch.meta_info.get("fully_async/sample_metadata")
+            if not isinstance(sample_metadata, list) or not sample_metadata:
+                raise ValueError("fully-async assembled batch is missing per-episode sample metadata")
+            data_sources = []
+            for metadata in sample_metadata:
+                if not isinstance(metadata, dict):
+                    raise TypeError("fully-async sample metadata entries must be dictionaries")
+                action_rows = metadata.get("real_action_rows")
+                if isinstance(action_rows, bool) or not isinstance(action_rows, int) or action_rows <= 0:
+                    raise ValueError("fully-async real_action_rows must be a positive integer")
+                data_source = str(metadata.get("data_source") or "__unlabeled__")
+                data_sources.extend([data_source] * action_rows)
             if len(data_sources) != len(trajectory_param_versions):
                 raise ValueError(
-                    "fully-async data_source and policy-version rows must have equal length"
+                    "fully-async episode metadata and policy-version rows must have equal length"
                 )
 
             stale_traj_count = 0
