@@ -14,13 +14,38 @@
 
 import asyncio
 import logging
-from collections import deque
+from collections import Counter, deque
+from dataclasses import dataclass
 from typing import Any
 
 import ray
 from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
+
+
+_UNLABELED_DATA_SOURCE = "__unlabeled__"
+
+
+@dataclass(frozen=True)
+class _QueueEntry:
+    payload: Any
+    data_source: str
+
+
+def _normalize_data_source(data_source: Any) -> str:
+    if data_source is None:
+        return _UNLABELED_DATA_SOURCE
+    normalized = str(data_source).strip()
+    if not normalized:
+        return _UNLABELED_DATA_SOURCE
+    if len(normalized) > 256 or "\n" in normalized or "\r" in normalized:
+        raise ValueError("data_source queue label must be a single line of at most 256 characters")
+    return normalized
+
+
+def _counter_dict(counter: Counter[str]) -> dict[str, int]:
+    return {key: int(counter[key]) for key in sorted(counter)}
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
@@ -49,29 +74,41 @@ class MessageQueue:
         self.total_produced = 0
         self.total_consumed = 0
         self.dropped_samples = 0
+        self.total_cleared = 0
+        self.enqueued_by_data_source: Counter[str] = Counter()
+        self.consumed_by_data_source: Counter[str] = Counter()
+        self.evicted_by_data_source: Counter[str] = Counter()
+        self.cleared_by_data_source: Counter[str] = Counter()
 
         print(f"[MessageQueue] initialized with max_queue_size={max_queue_size}")
 
-    async def put_sample(self, sample: Any) -> bool:
+    async def put_sample(self, sample: Any, data_source: str | None = None) -> bool:
         """
         Put a batch sample into the queue
 
         Args:
             sample: Sample data
+            data_source: Optional opaque source label used only for accounting.
 
         Returns:
-            bool: Whether the sample was successfully put into the queue
+            bool: True when enqueued without eviction; False when an older
+                queued sample was evicted before this sample was accepted.
         """
+        data_source = _normalize_data_source(data_source)
         async with self._lock:
-            # If queue is full, remove the oldest sample (rarely happens)
+            # If queue is full, remove the oldest sample (rarely happens).
+            # Keep the evicted sample's label so overflow is not misattributed
+            # to the newly accepted sample.
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
-                self.queue.popleft()
+                evicted = self.queue.popleft()
                 self.dropped_samples += 1
+                self.evicted_by_data_source[evicted.data_source] += 1
                 is_drop = True
                 logger.warning("Queue full, dropped sample")
-            self.queue.append(sample)
+            self.queue.append(_QueueEntry(payload=sample, data_source=data_source))
             self.total_produced += 1
+            self.enqueued_by_data_source[data_source] += 1
 
             # Notify waiting consumers
             self._consumer_condition.notify_all()
@@ -98,9 +135,10 @@ class MessageQueue:
                 return None
 
             # Get one sample
-            data = self.queue.popleft()
+            entry = self.queue.popleft()
             self.total_consumed += 1
-            return data, len(self.queue)
+            self.consumed_by_data_source[entry.data_source] += 1
+            return entry.payload, len(self.queue)
 
     async def get_queue_size(self) -> int:
         """Get current queue length"""
@@ -110,18 +148,28 @@ class MessageQueue:
     async def get_statistics(self) -> dict[str, Any]:
         """Get queue statistics"""
         async with self._lock:
+            resident_by_data_source = Counter(entry.data_source for entry in self.queue)
             return {
                 "queue_size": len(self.queue),
                 "total_produced": self.total_produced,
                 "total_consumed": self.total_consumed,
                 "dropped_samples": self.dropped_samples,
+                "total_cleared": self.total_cleared,
                 "max_queue_size": self.max_queue_size,
+                "enqueued_by_data_source": _counter_dict(self.enqueued_by_data_source),
+                "consumed_by_data_source": _counter_dict(self.consumed_by_data_source),
+                "evicted_by_data_source": _counter_dict(self.evicted_by_data_source),
+                "cleared_by_data_source": _counter_dict(self.cleared_by_data_source),
+                "resident_by_data_source": _counter_dict(resident_by_data_source),
             }
 
     async def clear_queue(self):
         """Clear the queue"""
         async with self._lock:
             cleared_count = len(self.queue)
+            for entry in self.queue:
+                self.cleared_by_data_source[entry.data_source] += 1
+            self.total_cleared += cleared_count
             self.queue.clear()
             logger.info(f"Cleared {cleared_count} samples from queue")
 
@@ -144,7 +192,7 @@ class MessageQueue:
 
             if sample_count > 0:
                 # Estimate size of a single sample (simplified estimation)
-                sample = list(self.queue)[0]
+                sample = list(self.queue)[0].payload
                 try:
                     sample_size = sys.getsizeof(sample)
                     # Since we now store RolloutSample directly, estimate based on its components
@@ -183,9 +231,9 @@ class MessageQueueClient:
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
 
-    async def put_sample(self, sample: Any) -> bool:
-        """Put batch into queue (async)"""
-        future = self.queue_actor.put_sample.remote(sample)
+    async def put_sample(self, sample: Any, data_source: str | None = None) -> bool:
+        """Put batch into queue (async)."""
+        future = self.queue_actor.put_sample.remote(sample, data_source=data_source)
         return await asyncio.wrap_future(future.future())
 
     async def put_validate(self, data: Any) -> bool:

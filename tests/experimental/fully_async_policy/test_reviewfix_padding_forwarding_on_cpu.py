@@ -385,6 +385,7 @@ class TestFullyAsyncMetricPublication(IsolatedAsyncioTestCase):
             return_value={"dynamic_resource/rollout_resource_utilization": 0.5}
         )
         trainer._fit_dump_data = mock.Mock()
+        trainer._record_optimizer_consumption = mock.Mock()
         trainer._record_train_resource_utilization = mock.Mock()
         trainer._fit_validate = mock.AsyncMock()
         trainer._fit_save_checkpoint = mock.Mock()

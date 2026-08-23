@@ -14,7 +14,7 @@
 import asyncio
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -37,6 +37,42 @@ class RolloutSample:
 
     # Processing metadata
     rollout_status: dict[str, Any]
+    sample_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def extract_scalar_sample_metadata(
+    batch: DataProto, keys: tuple[str, ...] = ("data_source",)
+) -> dict[str, str]:
+    """Extract one stable scalar label per requested non-tensor field.
+
+    Fully-async queue accounting is deliberately task agnostic.  A producer may
+    attach ordinary dataset metadata (``data_source`` by default), but one
+    complete rollout sample cannot claim multiple values for the same label.
+    Missing labels remain optional for backward compatibility.
+    """
+
+    metadata: dict[str, str] = {}
+    for key in keys:
+        if not isinstance(key, str) or not key:
+            raise ValueError("sample metadata keys must be non-empty strings")
+        if key not in batch.non_tensor_batch:
+            continue
+        raw_values = np.asarray(batch.non_tensor_batch[key], dtype=object).reshape(-1)
+        values = {str(value).strip() for value in raw_values.tolist() if value is not None and str(value).strip()}
+        if len(values) > 1:
+            raise ValueError(
+                f"one fully-async rollout sample has multiple values for {key!r}: "
+                f"{sorted(values)!r}"
+            )
+        if values:
+            value = next(iter(values))
+            if len(value) > 256 or "\n" in value or "\r" in value:
+                raise ValueError(
+                    f"sample metadata value for {key!r} must be a single line "
+                    "of at most 256 characters"
+                )
+            metadata[key] = value
+    return metadata
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -108,6 +144,8 @@ def assemble_batch_from_rollout_samples(
     print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
     rollout_samples_batch = []
+    sample_metadata = []
+    sample_row_counts = []
     rollout_status = rollout_samples[0].rollout_status
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
@@ -115,11 +153,27 @@ def assemble_batch_from_rollout_samples(
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
         rollout_samples_batch.append(batch)
+        sample_row_counts.append(len(batch))
+        sample_metadata.append(dict(rs.sample_metadata or {}))
     final_batch = DataProto.concat(rollout_samples_batch)
 
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
+
+    row_offset = 0
+    for metadata, row_count in zip(sample_metadata, sample_row_counts, strict=True):
+        next_offset = row_offset + row_count
+        metadata["real_action_rows"] = row_count
+        metadata["policy_response_tokens"] = int(
+            final_batch.batch["response_mask"][row_offset:next_offset].sum().item()
+        )
+        row_offset = next_offset
+    if row_offset != len(final_batch):
+        raise RuntimeError(
+            "fully-async sample row accounting does not match assembled batch size: "
+            f"{row_offset} != {len(final_batch)}"
+        )
 
     if balance_batch:
         balance_batch(final_batch, metrics={})
@@ -164,6 +218,8 @@ def assemble_batch_from_rollout_samples(
         {
             "param_version_diversity": len(set(trajectory_param_versions)),
             "trajectory_param_versions": trajectory_param_versions,
+            "fully_async/sample_metadata": sample_metadata,
+            "fully_async/real_episode_count": len(sample_metadata),
             **processing_time_stats,
             **rollout_status,
             **partial_stats,
@@ -247,6 +303,8 @@ class MetricsAggregator:
 
     def _get_aggregation_type(self, metric_name: str) -> str:
         """Determine the aggregation type based on the metric name"""
+        if metric_name.startswith("fully_async/count/"):
+            return "last"
         for agg_type, metric_list in self.aggregation_rules.items():
             if metric_name in metric_list:
                 return agg_type

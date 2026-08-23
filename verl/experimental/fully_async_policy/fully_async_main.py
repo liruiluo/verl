@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
+import json
 import os
 import socket
 import threading
@@ -183,6 +183,54 @@ class FullyAsyncTaskRunner:
                 "skipping hybrid worker group setup"
             )
 
+    def _collect_final_statistics(self, timeout_s: float = 30.0) -> dict:
+        """Collect all owner snapshots within one shared wall-clock timeout."""
+
+        requests = {
+            "queue": self.components["message_queue"].get_statistics.remote(),
+            "rollouter": self.components["rollouter"].get_statistics.remote(),
+            "trainer": self.components["trainer"].get_runtime_statistics.remote(),
+        }
+        ready, pending = ray.wait(
+            list(requests.values()),
+            num_returns=len(requests),
+            timeout=timeout_s,
+        )
+        ready_ids = {id(request) for request in ready}
+        pending_ids = {id(request) for request in pending}
+        statistics = {"schema": "verl_fully_async_final_statistics_v1"}
+        for name, request in requests.items():
+            if id(request) in pending_ids or id(request) not in ready_ids:
+                statistics[name] = {
+                    "error_type": "TimeoutError",
+                    "error": f"statistics owner did not answer within shared {timeout_s:.1f}s timeout",
+                }
+                continue
+            try:
+                statistics[name] = ray.get(request)
+            except Exception as exc:
+                statistics[name] = {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:512],
+                }
+        return statistics
+
+    def _finalize_statistics(self, timeout_s: float = 30.0) -> dict:
+        """Clear residual queue entries, then snapshot cleanup-inclusive counters."""
+
+        cleanup = {"status": "completed"}
+        try:
+            ray.get(self.components["message_queue"].clear_queue.remote(), timeout=timeout_s)
+        except Exception as exc:
+            cleanup = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:512],
+            }
+        statistics = self._collect_final_statistics(timeout_s=timeout_s)
+        statistics["queue_cleanup"] = cleanup
+        return statistics
+
     def _run_training_loop(self):
         self.running = True
 
@@ -215,7 +263,12 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            asyncio.run(self.components["message_queue_client"].clear_queue())
+            final_statistics = self._finalize_statistics()
+            print(
+                "[FullyAsyncTaskRunner][FinalStatistics] "
+                + json.dumps(final_statistics, sort_keys=True),
+                flush=True,
+            )
             print("[ASYNC MAIN] Training completed or interrupted")
 
 

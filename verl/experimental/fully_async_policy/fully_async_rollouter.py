@@ -27,6 +27,7 @@ from omegaconf import DictConfig, open_dict
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
+    extract_scalar_sample_metadata,
     prepare_single_generation_data,
     safe_create_task,
 )
@@ -431,8 +432,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Statistics
         self.total_generated_samples = 0
         self.staleness_samples = 0
-        self.dropped_stale_samples = 0
         self.processed_sample_count = 0
+        self.rollout_completed_samples = 0
+        self.rollout_failed_samples = 0
+        self.rollout_completed_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_failed_by_data_source: collections.Counter[str] = collections.Counter()
+        # Kept as a compatibility metric. Queue overflow is not a stale-policy
+        # rejection and is accounted separately below.
+        self.dropped_stale_samples = 0
         # Per-step sample counter: counts fully-generated samples in the current param version.
         # Reset to 0 at each reset_staleness() call.
         self._step_generated_samples: int = 0
@@ -623,6 +630,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self._step_generated_samples = 0
 
             timing_raw["dynamic_resource/rollout_resource_utilization"] = self._compute_rollout_resource_utilization()
+            statistics = await self.get_statistics()
+            timing_raw.update(
+                {
+                    f"fully_async/{key}": value
+                    for key, value in statistics.items()
+                    if key.startswith("count/")
+                }
+            )
 
             print(
                 f"[FullyAsyncRollouter][Public][reset_staleness] "
@@ -870,6 +885,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 sample_id=sample_id,
                 epoch=epoch,
                 rollout_status={},
+                sample_metadata=extract_scalar_sample_metadata(full_batch),
             )
 
             await self.pending_queue.put(rollout_sample)
@@ -995,23 +1011,37 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        data_source = rollout_sample.sample_metadata.get("data_source")
+        try:
+            ret = await self.async_rollout_manager.generate_sequences_single(
+                rollout_sample.full_batch
+            )
 
-        rollout_sample.full_batch = ret
-        # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
-        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-        )
-        rollout_sample.rollout_status = await self.get_statistics()
+            rollout_sample.full_batch = ret
+            # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
+            rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
+                [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
+            )
+            rollout_sample.rollout_status = await self.get_statistics()
+        except Exception:
+            self.rollout_failed_samples += 1
+            if data_source is not None:
+                self.rollout_failed_by_data_source[data_source] += 1
+            raise
 
-        success = await self.message_queue_client.put_sample(
+        self.rollout_completed_samples += 1
+        if data_source is not None:
+            self.rollout_completed_by_data_source[data_source] += 1
+        enqueued_without_eviction = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
+            data_source=data_source,
         )
-        if success:
-            self.total_generated_samples += 1
-            self._step_generated_samples += 1
-        else:
-            self.dropped_stale_samples += 1
+        # The current sample is always enqueued. A False result reports that the
+        # bounded queue evicted an older sample to make room.
+        self.total_generated_samples += 1
+        self._step_generated_samples += 1
+        if not enqueued_without_eviction:
+            logger.warning("Queue overflow evicted an older fully-async sample")
         self.processed_sample_count += 1
 
     async def _streaming_generation_main(self):
@@ -1174,8 +1204,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
-            # counting stats
+            # cumulative event accounting
             "count/total_generated_samples": self.total_generated_samples,
+            "count/rollout_completed_samples": self.rollout_completed_samples,
+            "count/rollout_failed_samples": self.rollout_failed_samples,
+            "count/queue_enqueued_samples": queue_stats["total_produced"],
+            "count/queue_dequeued_samples": queue_stats["total_consumed"],
+            "count/queue_overflow_evictions": queue_stats["dropped_samples"],
+            "count/queue_cleared_samples": queue_stats["total_cleared"],
+            "count/queue_resident_samples": queue_stats["queue_size"],
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
             # static stats
@@ -1185,6 +1222,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
+        labeled_counters = {
+            "rollout_completed": self.rollout_completed_by_data_source,
+            "rollout_failed": self.rollout_failed_by_data_source,
+            "queue_enqueued": queue_stats["enqueued_by_data_source"],
+            "queue_dequeued": queue_stats["consumed_by_data_source"],
+            "queue_overflow_evicted": queue_stats["evicted_by_data_source"],
+            "queue_cleared": queue_stats["cleared_by_data_source"],
+            "queue_resident": queue_stats["resident_by_data_source"],
+        }
+        for event, counts in labeled_counters.items():
+            for data_source, count in counts.items():
+                stats[f"count/{event}/data_source/{data_source}"] = int(count)
 
         return stats
 
