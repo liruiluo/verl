@@ -402,12 +402,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_samples = []
         queue_len = 0
         while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = await self.message_queue_client.get_sample()
-
+            # Native queue shutdown returns None only after all accepted samples
+            # have been drained.  Check the optional result before unpacking it.
+            item = await self.message_queue_client.get_sample()
+            if item is None:
+                print(
+                    f"[FullyAsyncTrainer] Detected queue shutdown, stopping sample collection. "
+                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
+                )
+                break
+            sample, queue_len = item
+            # Keep accepting the legacy in-band sentinel during mixed-version
+            # recovery, but new rollouters close the queue out of band.
             if sample is None:
                 print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                    f"[FullyAsyncTrainer] Detected legacy termination signal, stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
