@@ -1067,6 +1067,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.feed_task = None
             self.processor_task = None
 
+            # The processor owns per-sample producer tasks.  On an exception it
+            # can be cancelled before it drains ``active_tasks``; quiesce every
+            # producer before closing the shared queue so no task can enqueue an
+            # orphaned sample after the trainer has observed EOS.
+            async with self.lock:
+                active_tasks = tuple(self.active_tasks)
+                for task in active_tasks:
+                    task.cancel()
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+                async with self.lock:
+                    self.active_tasks.difference_update(active_tasks)
+                    self._record_active_count()
+
             # Close the queue without inserting an in-band sentinel.  A sentinel
             # would consume bounded capacity and can evict a real rollout when the
             # queue is full.  Native shutdown drains accepted samples first, then

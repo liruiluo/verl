@@ -436,9 +436,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         consumer_end = time.time()
 
-        if not queue_samples or len(queue_samples) < self.required_samples:
-            print("[FullyAsyncTrainer] not enough samples collected after loop")
+        if not queue_samples:
+            print("[FullyAsyncTrainer] no samples collected after loop")
             return None, None
+        final_partial_batch = len(queue_samples) < self.required_samples
+        if final_partial_batch:
+            print(
+                "[FullyAsyncTrainer] processing final partial batch: "
+                f"{len(queue_samples)}/{self.required_samples} real episodes"
+            )
         total_wait_time = consumer_end - consumer_start
 
         print(
@@ -455,6 +461,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        batch.meta_info["fully_async/final_partial_batch"] = final_partial_batch
+        batch.meta_info["fully_async/real_episode_count"] = len(queue_samples)
         self._step_wait_times.append(total_wait_time)
         # pending_wait_samples may be 0 when this collection was served entirely
         # from queue backlog (no real waiting for generation happened); the policy
