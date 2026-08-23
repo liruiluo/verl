@@ -96,6 +96,16 @@ class MessageQueue:
         """
         data_source = _normalize_data_source(data_source)
         async with self._lock:
+            # Older rollouters used an in-band ``None`` sentinel. Translate it
+            # into native shutdown without consuming bounded queue capacity or
+            # evicting an accepted rollout.
+            if sample is None:
+                self.running = False
+                self._consumer_condition.notify_all()
+                return True
+            if not self.running:
+                raise RuntimeError("cannot put a sample after the message queue is shut down")
+
             # If queue is full, remove the oldest sample (rarely happens).
             # Keep the evicted sample's label so overflow is not misattributed
             # to the newly accepted sample.
