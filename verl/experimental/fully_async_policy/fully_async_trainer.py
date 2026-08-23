@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -142,6 +143,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.local_trigger_step = 1
         self.processed_samples = 0
         self.stale_trajectory_processed = 0
+        self.optimizer_consumed_episodes = 0
+        self.optimizer_consumed_action_rows = 0
+        self.optimizer_consumed_policy_response_tokens = 0
+        self.optimizer_consumed_episodes_by_data_source: Counter[str] = Counter()
+        self.optimizer_consumed_action_rows_by_data_source: Counter[str] = Counter()
+        self.optimizer_consumed_policy_response_tokens_by_data_source: Counter[str] = Counter()
+        self.stale_action_rows_by_data_source: Counter[str] = Counter()
         self.current_param_version = 0
         self.total_train_steps = None
         self.progress_bar = None
@@ -608,6 +616,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = self._fit_compute_advantage(batch)
             batch = self._fit_update_critic(batch)
             batch = self._fit_update_actor(batch)
+            self._record_optimizer_consumption(batch)
             self._fit_update_local_step()
             rollout_reset_timing_raw = await self._fit_update_weights()
             self._fit_dump_data(batch)
@@ -879,6 +888,93 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
         return old_log_prob, old_log_prob_mfu
 
+    def _record_optimizer_consumption(self, batch: DataProto) -> None:
+        """Record exact real episode/action/token work after learner updates succeed."""
+
+        meta_info = getattr(batch, "meta_info", {})
+        sample_metadata = meta_info.get("fully_async/sample_metadata")
+        if not isinstance(sample_metadata, list) or not sample_metadata:
+            raise ValueError("fully-async assembled batch is missing per-episode sample metadata")
+
+        real_episode_count = meta_info.get("fully_async/real_episode_count", len(sample_metadata))
+        if isinstance(real_episode_count, bool) or not isinstance(real_episode_count, int):
+            raise TypeError("fully_async/real_episode_count must be an integer")
+        if real_episode_count != len(sample_metadata):
+            raise ValueError(
+                "fully-async sample metadata count does not match real episode count: "
+                f"{len(sample_metadata)} != {real_episode_count}"
+            )
+
+        real_batch = self._without_synthetic_padding(batch)
+        if "response_mask" not in real_batch.batch:
+            raise ValueError("fully-async optimizer accounting requires response_mask")
+        expected_action_rows = len(real_batch)
+        expected_response_tokens = int(real_batch.batch["response_mask"].sum().item())
+
+        per_update_episodes: Counter[str] = Counter()
+        per_update_action_rows: Counter[str] = Counter()
+        per_update_response_tokens: Counter[str] = Counter()
+        for metadata in sample_metadata:
+            if not isinstance(metadata, dict):
+                raise TypeError("fully-async sample metadata entries must be dictionaries")
+            data_source = str(metadata.get("data_source") or "__unlabeled__")
+            action_rows = metadata.get("real_action_rows")
+            response_tokens = metadata.get("policy_response_tokens")
+            if isinstance(action_rows, bool) or not isinstance(action_rows, int) or action_rows <= 0:
+                raise ValueError("fully-async real_action_rows must be a positive integer")
+            if (
+                isinstance(response_tokens, bool)
+                or not isinstance(response_tokens, int)
+                or response_tokens < 0
+            ):
+                raise ValueError("fully-async policy_response_tokens must be a non-negative integer")
+            per_update_episodes[data_source] += 1
+            per_update_action_rows[data_source] += action_rows
+            per_update_response_tokens[data_source] += response_tokens
+
+        action_rows = sum(per_update_action_rows.values())
+        response_tokens = sum(per_update_response_tokens.values())
+        if action_rows != expected_action_rows:
+            raise ValueError(
+                "fully-async per-episode action-row accounting does not match real learner rows: "
+                f"{action_rows} != {expected_action_rows}"
+            )
+        if response_tokens != expected_response_tokens:
+            raise ValueError(
+                "fully-async per-episode response-token accounting does not match real learner tokens: "
+                f"{response_tokens} != {expected_response_tokens}"
+            )
+
+        self.optimizer_consumed_episodes = getattr(self, "optimizer_consumed_episodes", 0) + real_episode_count
+        self.optimizer_consumed_action_rows = (
+            getattr(self, "optimizer_consumed_action_rows", 0) + action_rows
+        )
+        self.optimizer_consumed_policy_response_tokens = (
+            getattr(self, "optimizer_consumed_policy_response_tokens", 0) + response_tokens
+        )
+        counter_specs = (
+            ("episodes", per_update_episodes),
+            ("action_rows", per_update_action_rows),
+            ("policy_response_tokens", per_update_response_tokens),
+        )
+        for measure, per_update in counter_specs:
+            attr_name = f"optimizer_consumed_{measure}_by_data_source"
+            cumulative = getattr(self, attr_name, Counter())
+            cumulative.update(per_update)
+            setattr(self, attr_name, cumulative)
+            self.metrics[f"fully_async/sum/optimizer_consumed_{measure}"] = sum(per_update.values())
+            self.metrics[f"fully_async/count/optimizer_consumed_{measure}"] = getattr(
+                self, f"optimizer_consumed_{measure}"
+            )
+            for data_source, count in per_update.items():
+                self.metrics[
+                    f"fully_async/sum/optimizer_consumed_{measure}/data_source/{data_source}"
+                ] = count
+            for data_source, count in cumulative.items():
+                self.metrics[
+                    f"fully_async/count/optimizer_consumed_{measure}/data_source/{data_source}"
+                ] = count
+
     def _fit_update_local_step(self):
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
@@ -1113,8 +1209,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # an average across the cycle's micro-steps.
         self.metrics["dynamic_resource/mq_size"] = self.message_queue_client.get_queue_size_sync()
 
+        real_episode_count = int(
+            self.metrics.get("fully_async/sum/optimizer_consumed_episodes", self.required_samples)
+        )
         self.metrics_aggregator.add_step_metrics(
-            metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
+            metrics=self.metrics, sample_count=real_episode_count, timestamp=time.time()
         )
 
         if self.local_trigger_step == 1:
@@ -1237,19 +1336,59 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return self.current_param_version
 
     def _collect_metrics_from_samples(self, batch, metrics):
-        """
-        Collect metrics from samples
-        """
+        """Collect fully-async metrics without counting synthetic padding rows."""
         if hasattr(batch, "meta_info") and batch.meta_info:
-            trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
-            stale_traj_count = sum(1 for v in trajectory_param_versions if self.current_param_version - v >= 1)
+            real_batch = self._without_synthetic_padding(batch)
+            trajectory_param_versions = real_batch.non_tensor_batch["max_global_steps"]
+            data_sources = real_batch.non_tensor_batch.get("data_source")
+            if data_sources is None:
+                data_sources = np.array(["__unlabeled__"] * len(real_batch), dtype=object)
+            if len(data_sources) != len(trajectory_param_versions):
+                raise ValueError(
+                    "fully-async data_source and policy-version rows must have equal length"
+                )
+
+            stale_traj_count = 0
+            stale_by_data_source: Counter[str] = Counter()
+            for version, source in zip(trajectory_param_versions, data_sources, strict=True):
+                if self.current_param_version - int(version) >= 1:
+                    stale_traj_count += 1
+                    stale_by_data_source[str(source or "__unlabeled__")] += 1
             self.stale_trajectory_processed += stale_traj_count
+            self.stale_action_rows_by_data_source.update(stale_by_data_source)
             metrics.update(
                 {
                     "fully_async/count/stale_trajectory_processed": self.stale_trajectory_processed,
                     "fully_async/count/current_param_version": self.current_param_version,
                 }
             )
+            for data_source, count in self.stale_action_rows_by_data_source.items():
+                metrics[
+                    f"fully_async/count/stale_action_rows/data_source/{data_source}"
+                ] = count
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+
+    def get_runtime_statistics(self) -> dict[str, Any]:
+        """Return cumulative learner-owned queue consumption evidence."""
+
+        return {
+            "optimizer_consumed_episodes": self.optimizer_consumed_episodes,
+            "optimizer_consumed_action_rows": self.optimizer_consumed_action_rows,
+            "optimizer_consumed_policy_response_tokens": self.optimizer_consumed_policy_response_tokens,
+            "optimizer_consumed_episodes_by_data_source": dict(
+                sorted(self.optimizer_consumed_episodes_by_data_source.items())
+            ),
+            "optimizer_consumed_action_rows_by_data_source": dict(
+                sorted(self.optimizer_consumed_action_rows_by_data_source.items())
+            ),
+            "optimizer_consumed_policy_response_tokens_by_data_source": dict(
+                sorted(self.optimizer_consumed_policy_response_tokens_by_data_source.items())
+            ),
+            "stale_action_rows": self.stale_trajectory_processed,
+            "stale_action_rows_by_data_source": dict(
+                sorted(self.stale_action_rows_by_data_source.items())
+            ),
+            "current_param_version": self.current_param_version,
+        }
