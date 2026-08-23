@@ -1067,8 +1067,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.feed_task = None
             self.processor_task = None
 
-            # Send a finish signal
-            await self.message_queue_client.put_sample(sample=None)
+            # Close the queue without inserting an in-band sentinel.  A sentinel
+            # would consume bounded capacity and can evict a real rollout when the
+            # queue is full.  Native shutdown drains accepted samples first, then
+            # returns None once the queue is empty.
+            await self.message_queue_client.shutdown()
 
             async with self.lock:
                 self.running = False
