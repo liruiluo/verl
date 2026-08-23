@@ -231,6 +231,29 @@ class FullyAsyncTaskRunner:
         statistics["queue_cleanup"] = cleanup
         return statistics
 
+    @staticmethod
+    def _cancel_and_join_owners(futures, timeout_s: float = 30.0) -> None:
+        """Cancel outstanding owner calls and wait for their cleanup to finish."""
+
+        futures = list(futures)
+        for future in futures:
+            ray.cancel(future)
+        if not futures:
+            return
+
+        ready, pending = ray.wait(futures, num_returns=len(futures), timeout=timeout_s)
+        if pending:
+            raise RuntimeError(
+                f"{len(pending)} fully-async owner(s) did not quiesce within {timeout_s:.1f}s"
+            )
+        for future in ready:
+            try:
+                ray.get(future)
+            except Exception:
+                # Cancellation and the original component failure are expected;
+                # readiness is the cleanup barrier needed before queue finalization.
+                pass
+
     def _run_training_loop(self):
         self.running = True
 
@@ -239,11 +262,12 @@ class FullyAsyncTaskRunner:
         trainer_future = self.components["trainer"].fit.remote()
 
         futures = [rollouter_future, trainer_future]
+        owners_quiesced = False
 
         try:
             while futures:
                 # Use ray.wait to monitor all futures and return when any one is completed.
-                done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
+                done_futures, futures = ray.wait(futures, num_returns=1, timeout=None)
 
                 for future in done_futures:
                     try:
@@ -251,24 +275,32 @@ class FullyAsyncTaskRunner:
                         print("[ASYNC MAIN] One component completed successfully")
                     except Exception as e:
                         print(f"[ASYNC MAIN] Component failed with error: {e}")
-                        for remaining_future in remaining_futures:
-                            ray.cancel(remaining_future)
-                        raise e
+                        raise
 
-                futures = remaining_futures
+            owners_quiesced = True
 
         except Exception as e:
             print(f"[ASYNC MAIN] Training failed: {e}")
-            for future in futures:
-                ray.cancel(future)
+            try:
+                self._cancel_and_join_owners(futures)
+            except Exception as quiescence_error:
+                print(f"[ASYNC MAIN] Owner quiescence failed: {quiescence_error}")
+                raise quiescence_error from e
+            owners_quiesced = True
             raise
         finally:
-            final_statistics = self._finalize_statistics()
-            print(
-                "[FullyAsyncTaskRunner][FinalStatistics] "
-                + json.dumps(final_statistics, sort_keys=True),
-                flush=True,
-            )
+            if owners_quiesced:
+                final_statistics = self._finalize_statistics()
+                print(
+                    "[FullyAsyncTaskRunner][FinalStatistics] "
+                    + json.dumps(final_statistics, sort_keys=True),
+                    flush=True,
+                )
+            else:
+                print(
+                    "[ASYNC MAIN] Skipping queue clear and final snapshots because owners are still live",
+                    flush=True,
+                )
             print("[ASYNC MAIN] Training completed or interrupted")
 
 
