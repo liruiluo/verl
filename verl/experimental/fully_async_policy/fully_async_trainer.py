@@ -861,9 +861,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 is_row_aligned = len(value) == len(batch)
             except TypeError:
                 is_row_aligned = False
-            filtered_reward_extra_infos[key] = (
-                [item for item, keep in zip(value, keep_mask, strict=True) if keep] if is_row_aligned else value
-            )
+            if not is_row_aligned:
+                filtered_reward_extra_infos[key] = value
+            elif isinstance(value, np.ndarray):
+                # Preserve NumPy dtype so the parent logger's ``tolist()``
+                # converts scalar booleans/numbers to JSON-native values.
+                # A Python list here would leave ``np.bool_`` elements for
+                # ``json.dumps(default=str)``, producing the string "False".
+                filtered_reward_extra_infos[key] = value[keep_mask]
+            else:
+                filtered_reward_extra_infos[key] = [
+                    item for item, keep in zip(value, keep_mask, strict=True) if keep
+                ]
 
         self.reward_extra_infos_dict = filtered_reward_extra_infos
         try:

@@ -298,6 +298,7 @@ class TestPaddingNativeCompatibility(TestCase):
         )
         original_extras = {
             "row_receipt": [f"receipt-{index}" for index in range(len(padded))],
+            "is_padding": padded.non_tensor_batch["is_padding"].copy(),
             "aggregate": "kept-as-is",
         }
         trainer.reward_extra_infos_dict = original_extras
@@ -326,6 +327,11 @@ class TestPaddingNativeCompatibility(TestCase):
         self.assertEqual(len(seen["dump_batch"]), REAL_ROWS)
         self.assertEqual(len(seen["metrics_batch"]), REAL_ROWS)
         self.assertEqual(seen["dump_extras"]["row_receipt"], original_extras["row_receipt"][:REAL_ROWS])
+        dumped_padding = seen["dump_extras"]["is_padding"]
+        self.assertIsInstance(dumped_padding, np.ndarray)
+        self.assertEqual(dumped_padding.dtype, np.dtype(bool))
+        self.assertEqual(dumped_padding.tolist(), [False] * REAL_ROWS)
+        self.assertTrue(all(type(value) is bool for value in dumped_padding.tolist()))
         self.assertEqual(seen["dump_extras"]["aggregate"], "kept-as-is")
         self.assertIs(trainer.reward_extra_infos_dict, original_extras)
 
