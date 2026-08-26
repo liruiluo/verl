@@ -305,6 +305,8 @@ class MetricsAggregator:
         """Determine the aggregation type based on the metric name"""
         if metric_name.startswith("fully_async/count/"):
             return "last"
+        if metric_name.startswith("fully_async/sum/"):
+            return "sum"
         for agg_type, metric_list in self.aggregation_rules.items():
             if metric_name in metric_list:
                 return agg_type

@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -881,7 +882,114 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.reward_extra_infos_dict = original_reward_extra_infos
 
     def _fit_collect_metrics(self, batch: DataProto) -> None:
-        super()._fit_collect_metrics(self._without_synthetic_padding(batch))
+        real_batch = self._without_synthetic_padding(batch)
+        super()._fit_collect_metrics(real_batch)
+        route_metrics = self._compute_data_source_advantage_statistics(real_batch)
+        if route_metrics:
+            self.metrics.update(route_metrics)
+
+    @staticmethod
+    def _compute_data_source_advantage_statistics(batch: DataProto) -> dict[str, float]:
+        """Return additive route-level PPO input statistics.
+
+        The fully-async learner may reorder action rows while balancing a batch,
+        so route labels must come from the row-aligned ``data_source`` field and
+        not from the original per-episode queue metadata.  Every emitted metric
+        is a sufficient statistic whose name contains ``/sum/``; this lets the
+        native :class:`MetricsAggregator` add values correctly when one weight
+        publication spans multiple optimizer updates.
+
+        ``returns - values`` reconstructs the pre-normalization action
+        advantage for GAE-style estimators (including AMG action-axis GAE).
+        The post-normalization statistics use the exact ``advantages`` tensor
+        consumed by the actor.  The unit-ratio policy-gradient numerator is an
+        objective-mass proxy only: it deliberately does not claim to be the
+        actor's measured per-route loss or gradient.
+        """
+
+        if "data_source" not in batch.non_tensor_batch:
+            return {}
+
+        required_tensors = ("response_mask", "advantages")
+        missing = [name for name in required_tensors if name not in batch.batch]
+        if missing:
+            raise ValueError(f"fully-async data-source advantage statistics require tensor fields {missing!r}")
+
+        data_sources = np.asarray(batch.non_tensor_batch["data_source"], dtype=object).reshape(-1)
+        if data_sources.shape != (len(batch),):
+            raise ValueError(
+                "data_source must contain exactly one label per real learner row, "
+                f"got shape={data_sources.shape}, batch_size={len(batch)}"
+            )
+
+        response_mask = batch.batch["response_mask"].to(dtype=torch.bool)
+        advantages = batch.batch["advantages"]
+        if response_mask.shape != advantages.shape:
+            raise ValueError(
+                "response_mask and advantages must have identical shapes for "
+                f"route statistics, got {tuple(response_mask.shape)} and {tuple(advantages.shape)}"
+            )
+        if response_mask.ndim != 2:
+            raise ValueError(
+                f"fully-async route statistics require rank-2 response tensors, got ndim={response_mask.ndim}"
+            )
+
+        valid_tokens_per_row = response_mask.sum(dim=-1)
+        if torch.any(valid_tokens_per_row <= 0):
+            bad_rows = torch.nonzero(valid_tokens_per_row <= 0, as_tuple=False).flatten().tolist()
+            raise ValueError(f"real learner rows must contain sampled response tokens, bad_rows={bad_rows}")
+        if not torch.isfinite(advantages[response_mask]).all():
+            raise ValueError("fully-async route statistics require finite post-normalization advantages")
+
+        first_valid_token = response_mask.to(dtype=torch.int64).argmax(dim=-1)
+        row_indices = torch.arange(len(batch), device=advantages.device)
+        post_action_advantages = advantages[row_indices, first_valid_token]
+
+        pre_action_advantages = None
+        has_returns = "returns" in batch.batch
+        has_values = "values" in batch.batch
+        if has_returns and has_values:
+            returns = batch.batch["returns"]
+            values = batch.batch["values"]
+            if returns.shape != advantages.shape or values.shape != advantages.shape:
+                raise ValueError("returns, values, and advantages must have identical shapes for route statistics")
+            pre_action_advantages = returns[row_indices, first_valid_token] - values[row_indices, first_valid_token]
+            if not torch.isfinite(pre_action_advantages).all():
+                raise ValueError("fully-async route statistics require finite pre-normalization advantages")
+
+        normalized_sources = np.asarray(
+            [
+                str(value).strip() if value is not None and str(value).strip() else "__unlabeled__"
+                for value in data_sources
+            ],
+            dtype=object,
+        )
+        metrics: dict[str, float] = {}
+        for data_source in sorted(set(normalized_sources.tolist())):
+            route_rows_np = normalized_sources == data_source
+            route_rows = torch.as_tensor(route_rows_np, device=advantages.device, dtype=torch.bool)
+            route_token_mask = response_mask & route_rows.unsqueeze(-1)
+            route_post_action = post_action_advantages[route_rows]
+            route_post_tokens = advantages[route_token_mask]
+            prefix = f"fully_async/sum/route_advantage/data_source/{data_source}"
+
+            metrics[f"{prefix}/action_rows"] = float(route_rows.sum().item())
+            metrics[f"{prefix}/response_tokens"] = float(route_token_mask.sum().item())
+            metrics[f"{prefix}/post_whiten_action_sum"] = float(route_post_action.sum().item())
+            metrics[f"{prefix}/post_whiten_action_squared_sum"] = float(route_post_action.square().sum().item())
+            metrics[f"{prefix}/post_whiten_action_abs_sum"] = float(route_post_action.abs().sum().item())
+            metrics[f"{prefix}/post_whiten_token_sum"] = float(route_post_tokens.sum().item())
+            metrics[f"{prefix}/post_whiten_token_squared_sum"] = float(route_post_tokens.square().sum().item())
+            metrics[f"{prefix}/post_whiten_token_abs_sum"] = float(route_post_tokens.abs().sum().item())
+            metrics[f"{prefix}/unit_ratio_pg_numerator_sum"] = float(-route_post_tokens.sum().item())
+
+            if pre_action_advantages is not None:
+                route_pre_action = pre_action_advantages[route_rows]
+                metrics[f"{prefix}/pre_whiten_action_sum"] = float(route_pre_action.sum().item())
+                metrics[f"{prefix}/pre_whiten_action_squared_sum"] = float(route_pre_action.square().sum().item())
+                metrics[f"{prefix}/pre_whiten_action_abs_sum"] = float(route_pre_action.abs().sum().item())
+
+        return metrics
 
     def _compute_old_log_prob(self, batch: DataProto):
         """
