@@ -1445,12 +1445,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         poll_interval: float = 1.0,
         timeout: float | None = None,
     ) -> int:
-        """Block until the message queue contains at least ``required_count`` samples.
+        """Wait for enough queued samples or terminal producer shutdown.
 
         Polls ``message_queue_client.get_queue_size()`` every ``poll_interval``
-        seconds and returns only when the queue size reaches or exceeds
-        ``required_count``.  If ``required_count`` is ``None``, defaults to
-        ``self.required_samples``.
+        seconds.  While the rollouter is running, this returns only when the
+        queue size reaches or exceeds ``required_count``.  After the rollouter
+        has stopped, it returns the remaining queue size even when it is smaller
+        so the trainer can drain a final partial batch or observe queue EOS.
 
         The Trainer uses this to confirm that the queue truly holds enough
         completed trajectories *before* deactivating hybrid replicas — avoiding a
@@ -1464,7 +1465,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 exceeded.  ``None`` means no timeout.
 
         Returns:
-            The final queue size observed (≥ required_count).
+            The final queue size observed.  This is at least ``required_count``
+            during normal operation, but may be smaller after terminal producer
+            shutdown.
 
         Raises:
             TimeoutError: If ``timeout`` is set and the wait exceeds it.
