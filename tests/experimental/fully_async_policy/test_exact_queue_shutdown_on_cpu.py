@@ -147,6 +147,14 @@ class _FiniteQueueClient:
         return sample, len(self.samples)
 
 
+class _StaticQueueSizeClient:
+    def __init__(self, queue_size: int):
+        self.queue_size = queue_size
+
+    async def get_queue_size(self):
+        return self.queue_size
+
+
 class TestMessageQueueShutdown(IsolatedAsyncioTestCase):
     async def test_shutdown_drains_exact_multitask400_schedule_without_data_sentinel(self) -> None:
         queue_cls = _local_actor_class(MessageQueue)
@@ -228,6 +236,22 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
 
         self.assertIsNone(epoch)
         self.assertIsNone(batch)
+
+    async def test_dynamic_wait_releases_when_rollouter_has_stopped(self) -> None:
+        for queue_size in (0, EPISODES_PER_UPDATE - 1):
+            with self.subTest(queue_size=queue_size):
+                rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+                rollouter.message_queue_client = _StaticQueueSizeClient(queue_size)
+                rollouter.running = False
+
+                observed = await asyncio.wait_for(
+                    rollouter.wait_for_enough_samples(
+                        EPISODES_PER_UPDATE, poll_interval=0.001
+                    ),
+                    timeout=0.05,
+                )
+
+                self.assertEqual(observed, queue_size)
 
     async def test_partial_final_batch_is_returned_for_zero_loss_alignment(self) -> None:
         trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))

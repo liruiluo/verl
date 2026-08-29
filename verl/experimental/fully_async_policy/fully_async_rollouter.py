@@ -1482,6 +1482,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
                 return queue_size
 
+            # The finite rollout owner closes the shared queue and marks itself
+            # stopped after every accepted sample has reached the queue.  A
+            # dynamic-scheduling wait can race with that terminal transition:
+            # once generation has stopped, no additional sample can make this
+            # threshold reachable.  Return the remaining queue size so the
+            # trainer can drain a final partial batch (or observe queue EOS)
+            # instead of waiting forever after the declared training horizon.
+            if not self.running:
+                print(
+                    f"[FullyAsyncRollouter] wait_for_enough_samples: "
+                    f"rollouter stopped with queue_size={queue_size} "
+                    f"< required={required_count}; releasing terminal wait after "
+                    f"{time.time() - start_time:.2f}s",
+                    flush=True,
+                )
+                return queue_size
+
             if timeout is not None and (time.time() - start_time) >= timeout:
                 raise TimeoutError(
                     f"Timed out waiting for {required_count} samples in queue (current={queue_size}, waited={timeout}s)"
