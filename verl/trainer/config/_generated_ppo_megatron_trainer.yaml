@@ -467,6 +467,9 @@ actor_rollout_ref:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    parameter_freeze_policy: null
+    parameter_freeze_manifest_path: null
+    parameter_freeze_probe_elements_per_rank: 4096
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16
@@ -729,6 +732,9 @@ critic:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    parameter_freeze_policy: null
+    parameter_freeze_manifest_path: null
+    parameter_freeze_probe_elements_per_rank: 4096
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16

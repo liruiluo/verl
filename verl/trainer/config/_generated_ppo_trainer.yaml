@@ -22,6 +22,7 @@ actor_rollout_ref:
       num_cycles: 0.5
       lr_scheduler_type: constant
       zero_indexed_step: true
+      lr_scheduler_step_per_optimizer_step: false
       warmup_style: null
       override_optimizer_config: null
     fsdp_config:
@@ -448,6 +449,9 @@ actor_rollout_ref:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    parameter_freeze_policy: null
+    parameter_freeze_manifest_path: null
+    parameter_freeze_probe_elements_per_rank: 4096
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16
@@ -554,6 +558,7 @@ critic:
     num_cycles: 0.5
     lr_scheduler_type: constant
     zero_indexed_step: true
+    lr_scheduler_step_per_optimizer_step: false
     warmup_style: null
     override_optimizer_config: null
   fsdp:
@@ -687,6 +692,9 @@ critic:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    parameter_freeze_policy: null
+    parameter_freeze_manifest_path: null
+    parameter_freeze_probe_elements_per_rank: 4096
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16

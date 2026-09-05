@@ -94,3 +94,23 @@ class TestHFModelConfigCPU:
         merged_config = OmegaConf.merge(base_config, invalid_cli_config)
         with pytest.raises(TypeError):
             OmegaConf.to_object(merged_config)
+
+    def test_critic_parameter_freeze_fields_accept_plain_hydra_overrides(self):
+        """The PPO config must expose freeze fields without ``+key`` overrides."""
+        from hydra import compose, initialize_config_dir
+
+        config_dir = os.path.abspath("verl/trainer/config")
+        manifest_path = "/tmp/critic-parameter-freeze.json"
+        with initialize_config_dir(config_dir=config_dir, version_base=None):
+            config = compose(
+                config_name="ppo_trainer",
+                overrides=[
+                    "critic.model.parameter_freeze_policy=qwen35_dense_token_mixers_v1",
+                    f"critic.model.parameter_freeze_manifest_path={manifest_path}",
+                    "critic.model.parameter_freeze_probe_elements_per_rank=4096",
+                ],
+            )
+
+        assert config.critic.model.parameter_freeze_policy == "qwen35_dense_token_mixers_v1"
+        assert config.critic.model.parameter_freeze_manifest_path == manifest_path
+        assert config.critic.model.parameter_freeze_probe_elements_per_rank == 4096

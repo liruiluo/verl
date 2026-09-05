@@ -36,6 +36,15 @@ enable_gradient_checkpointing: True
 # whether to enable activation offload. Only valid when we use hf model definition
 enable_activation_offload: False
 
+# Optional fail-closed parameter-freezing policy for value models
+parameter_freeze_policy: null
+
+# Path for the parameter-freezing runtime manifest
+parameter_freeze_manifest_path: null
+
+# Number of frozen-parameter elements sampled per rank for runtime probes
+parameter_freeze_probe_elements_per_rank: 4096
+
 # whether to use remove padding. Only valid when we use hf model definition
 use_remove_padding: True
 
