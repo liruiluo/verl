@@ -33,10 +33,82 @@ import torch
 
 from verl.trainer.ppo.rollout_corr_helper import (
     SUPPORTED_ROLLOUT_RS_OPTIONS,
+    _partition_inclusive_numeric_bounds,
     compute_is_metrics,
     compute_offpolicy_metrics,
     compute_rollout_correction_and_rejection_mask,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_tolerant_numeric_bounds_form_one_complete_partition(dtype):
+    lower = 0.2
+    upper = 4.0
+    lower_tensor = torch.tensor(lower, dtype=dtype)
+    upper_tensor = torch.tensor(upper, dtype=dtype)
+    lower_adjacent = torch.nextafter(lower_tensor, torch.tensor(float("-inf"), dtype=dtype))
+    upper_adjacent = torch.nextafter(upper_tensor, torch.tensor(float("inf"), dtype=dtype))
+    eps = torch.finfo(dtype).eps
+    values = torch.stack(
+        [
+            lower_tensor - 32 * eps,
+            lower_adjacent,
+            lower_tensor,
+            upper_tensor,
+            upper_adjacent,
+            upper_tensor + 32 * eps * upper,
+        ]
+    )
+
+    low_mask, kept_mask, high_mask = _partition_inclusive_numeric_bounds(
+        values,
+        lower=lower,
+        upper=upper,
+    )
+
+    assert torch.equal(low_mask, torch.tensor([True, False, False, False, False, False]))
+    assert torch.equal(kept_mask, torch.tensor([False, True, True, True, True, False]))
+    assert torch.equal(high_mask, torch.tensor([False, False, False, False, False, True]))
+    partition_count = low_mask.to(torch.int8) + kept_mask.to(torch.int8) + high_mask.to(torch.int8)
+    assert torch.equal(partition_count, torch.ones_like(partition_count))
+
+
+def test_icepop_boundary_metrics_share_training_partition():
+    dtype = torch.float64
+    lower = torch.tensor(0.2, dtype=dtype)
+    upper = torch.tensor(4.0, dtype=dtype)
+    eps = torch.finfo(dtype).eps
+    raw_weights = torch.stack(
+        [
+            lower - 32 * eps,
+            torch.nextafter(lower, torch.tensor(float("-inf"), dtype=dtype)),
+            lower,
+            upper,
+            torch.nextafter(upper, torch.tensor(float("inf"), dtype=dtype)),
+            upper + 32 * eps * upper,
+        ]
+    ).unsqueeze(-1)
+    response_mask = torch.ones_like(raw_weights)
+
+    weights_proto, _, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=torch.log(raw_weights),
+        rollout_log_prob=torch.zeros_like(raw_weights),
+        response_mask=response_mask,
+        rollout_is="token",
+        rollout_is_threshold="0.2_4.0",
+        rollout_rs=None,
+    )
+
+    applied_weights = weights_proto.batch["rollout_is_weights"]
+    assert torch.equal(applied_weights.ne(0).squeeze(-1), torch.tensor([False, True, True, True, True, False]))
+    low_fraction = metrics["rollout_corr/rollout_is_ratio_fraction_low"]
+    high_fraction = metrics["rollout_corr/rollout_is_ratio_fraction_high"]
+    oob_fraction = metrics["rollout_corr/rollout_is_oob_ratio"]
+    assert low_fraction == pytest.approx(1.0 / 6.0)
+    assert high_fraction == pytest.approx(1.0 / 6.0)
+    assert oob_fraction == pytest.approx(low_fraction + high_fraction)
+    assert metrics["rollout_corr/rollout_is_seq_fraction_low"] == pytest.approx(low_fraction)
+    assert metrics["rollout_corr/rollout_is_seq_fraction_high"] == pytest.approx(high_fraction)
 
 
 def test_basic_rollout_correction():
@@ -440,6 +512,29 @@ def test_seq_fraction_high_uses_raw_weights():
     )
 
     assert metrics["rollout_is_seq_fraction_high"] == pytest.approx(0.5)
+
+
+def test_sequence_icepop_generic_minmax_use_applied_weights():
+    """Generic min/max must match the coefficients applied to the loss."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    raw_rollout_is_weights = torch.tensor([[0.25], [1.0], [4.0]], device=device)
+    rollout_is_weights = torch.tensor([[0.0], [1.0], [0.0]], device=device)
+    response_mask = torch.ones_like(raw_rollout_is_weights)
+
+    metrics = compute_is_metrics(
+        rollout_is_weights=rollout_is_weights,
+        raw_rollout_is_weights=raw_rollout_is_weights,
+        log_ratio_for_metrics=torch.log(raw_rollout_is_weights),
+        response_mask=response_mask,
+        rollout_is="sequence",
+        rollout_is_threshold=2.0,
+        rollout_is_threshold_lower=0.5,
+    )
+
+    assert metrics["rollout_is_min"] == pytest.approx(0.0)
+    assert metrics["rollout_is_max"] == pytest.approx(1.0)
+    assert metrics["rollout_is_seq_min"] == pytest.approx(0.0)
+    assert metrics["rollout_is_seq_max"] == pytest.approx(1.0)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
+from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig
 
 PolicyLossFn = Callable[
@@ -2466,9 +2467,22 @@ def compute_policy_loss_bypass_mode(
             loss: Scalar policy loss
             metrics: Dictionary with rollout correction metrics and actor/ppo_kl
     """
-    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
+    from verl.trainer.ppo.rollout_corr_helper import (
+        SAFETY_BOUND,
+        _partition_inclusive_numeric_bounds,
+        _parse_rollout_is_threshold,
+        compute_rollout_correction_and_rejection_mask,
+    )
 
     assert config is not None, "config is required for bypass_mode loss"
+
+    # A synthetic padding row may form its own dynamic micro-batch after the
+    # global learner batch is balanced across data-parallel ranks.  Such a
+    # micro-batch is deliberately optimizer-neutral: it contributes neither a
+    # token nor an IcePop/rollout-correction statistic.  Keep the returned zero
+    # connected to the model output so backward remains valid under FSDP.
+    if not response_mask.to(dtype=torch.bool).any():
+        return log_prob.sum() * 0.0, {}
 
     # Extract rollout_correction config from policy_loss
     rollout_corr_config = config.policy_loss.get("rollout_correction", None) if hasattr(config, "policy_loss") else None
@@ -2542,7 +2556,342 @@ def compute_policy_loss_bypass_mode(
     else:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
 
-    # Merge rollout correction metrics
+    # Preserve sufficient statistics for metrics that are published across
+    # dynamic micro-batches and DP ranks.  A scalar mean from each micro-batch
+    # is not mergeable: it overweights short batches and synthetic padding.
+    # Metric.from_dict() in the worker keeps these pre-aggregated Metric values.
+    valid_token_count = int(response_mask.to(dtype=torch.bool).sum().item())
+    valid_sequence_mask = response_mask.to(dtype=torch.bool).sum(dim=-1) > 0
+    valid_sequence_count = int(valid_sequence_mask.sum().item())
+
+    def _weighted_metric(key: str, aggregation: AggregationType, weight: int, **kwargs) -> None:
+        value = rollout_metrics.get(key)
+        if value is not None:
+            rollout_metrics[key] = Metric(
+                aggregation=aggregation,
+                value=value,
+                weight=weight,
+                **kwargs,
+            )
+
+    def _exact_mean(values: torch.Tensor) -> float:
+        """Mean without the epsilon bias used by generic masked_mean."""
+
+        if values.numel() == 0:
+            raise ValueError("cannot build an exact metric from no observations")
+        return values.detach().to(dtype=torch.float64).sum().item() / values.numel()
+
+    token_mean_keys = {
+        "rollout_corr/kl",
+        "rollout_corr/k3_kl",
+        "rollout_corr/chi2_token",
+    }
+    sequence_mean_keys = {
+        "rollout_corr/rollout_is_seq_mean",
+        "rollout_corr/rollout_is_seq_fraction_high",
+        "rollout_corr/rollout_is_seq_fraction_low",
+        "rollout_corr/training_ppl",
+        "rollout_corr/training_log_ppl",
+        "rollout_corr/rollout_ppl",
+        "rollout_corr/rollout_log_ppl",
+        "rollout_corr/log_ppl_diff",
+        "rollout_corr/log_ppl_abs_diff",
+        "rollout_corr/ppl_ratio",
+        "rollout_corr/chi2_seq",
+    }
+    for key in token_mean_keys:
+        _weighted_metric(key, AggregationType.MEAN, valid_token_count)
+    for key in sequence_mean_keys:
+        _weighted_metric(key, AggregationType.MEAN, valid_sequence_count)
+
+    for key in ("rollout_corr/rollout_is_min",):
+        _weighted_metric(key, AggregationType.MIN, valid_token_count)
+    for key in ("rollout_corr/rollout_is_max",):
+        _weighted_metric(key, AggregationType.MAX, valid_token_count)
+    for key in ("rollout_corr/rollout_is_seq_min", "rollout_corr/log_ppl_diff_min"):
+        _weighted_metric(key, AggregationType.MIN, valid_sequence_count)
+    for key in (
+        "rollout_corr/rollout_is_seq_max",
+        "rollout_corr/rollout_is_seq_max_deviation",
+        "rollout_corr/log_ppl_diff_max",
+    ):
+        _weighted_metric(key, AggregationType.MAX, valid_sequence_count)
+
+    if computed_is_weights is not None:
+        mask_bool = response_mask.to(dtype=torch.bool)
+        log_ratio = log_prob - rollout_log_prob
+        valid_log_ratio = log_ratio[mask_bool]
+        exact_kl = _exact_mean(-valid_log_ratio)
+        exact_k3 = _exact_mean(torch.exp(valid_log_ratio) - valid_log_ratio - 1.0)
+        exact_chi2_token = _exact_mean(
+            torch.exp(torch.clamp(valid_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)).square()
+        ) - 1.0
+        rollout_metrics["rollout_corr/kl"] = Metric(
+            aggregation=AggregationType.MEAN,
+            value=exact_kl,
+            weight=valid_token_count,
+        )
+        rollout_metrics["rollout_corr/k3_kl"] = Metric(
+            aggregation=AggregationType.MEAN,
+            value=exact_k3,
+            weight=valid_token_count,
+        )
+        rollout_metrics["rollout_corr/chi2_token"] = Metric(
+            aggregation=AggregationType.MEAN,
+            value=exact_chi2_token,
+            weight=valid_token_count,
+        )
+
+        sequence_token_counts = response_mask.sum(dim=-1).to(dtype=torch.float64)
+        current_sequence_log_prob = (
+            (log_prob.to(dtype=torch.float64) * response_mask).sum(dim=-1)
+            / sequence_token_counts.clamp_min(1.0)
+        )[valid_sequence_mask]
+        rollout_sequence_log_prob = (
+            (rollout_log_prob.to(dtype=torch.float64) * response_mask).sum(dim=-1)
+            / sequence_token_counts.clamp_min(1.0)
+        )[valid_sequence_mask]
+        training_log_ppl_values = -current_sequence_log_prob
+        rollout_log_ppl_values = -rollout_sequence_log_prob
+        log_ppl_diff_values = rollout_sequence_log_prob - current_sequence_log_prob
+        sequence_metric_values = {
+            "rollout_corr/training_ppl": torch.exp(training_log_ppl_values),
+            "rollout_corr/training_log_ppl": training_log_ppl_values,
+            "rollout_corr/rollout_ppl": torch.exp(rollout_log_ppl_values),
+            "rollout_corr/rollout_log_ppl": rollout_log_ppl_values,
+            "rollout_corr/log_ppl_diff": log_ppl_diff_values,
+            "rollout_corr/log_ppl_abs_diff": log_ppl_diff_values.abs(),
+            "rollout_corr/ppl_ratio": torch.exp(log_ppl_diff_values),
+        }
+        for key, values in sequence_metric_values.items():
+            rollout_metrics[key] = Metric(
+                aggregation=AggregationType.MEAN,
+                value=_exact_mean(values),
+                weight=valid_sequence_count,
+            )
+        rollout_metrics["rollout_corr/log_ppl_diff_min"] = Metric(
+            aggregation=AggregationType.MIN,
+            value=log_ppl_diff_values.min().item(),
+            weight=valid_sequence_count,
+        )
+        rollout_metrics["rollout_corr/log_ppl_diff_max"] = Metric(
+            aggregation=AggregationType.MAX,
+            value=log_ppl_diff_values.max().item(),
+            weight=valid_sequence_count,
+        )
+        sequence_log_ratio_for_chi2 = (
+            (log_ratio.to(dtype=torch.float64) * response_mask).sum(dim=-1)
+        )[valid_sequence_mask]
+        chi2_sequence_values = torch.exp(
+            2.0
+            * torch.clamp(
+                sequence_log_ratio_for_chi2,
+                min=-SAFETY_BOUND,
+                max=SAFETY_BOUND,
+            )
+        ) - 1.0
+        rollout_metrics["rollout_corr/chi2_seq"] = Metric(
+            aggregation=AggregationType.MEAN,
+            value=_exact_mean(chi2_sequence_values),
+            weight=valid_sequence_count,
+        )
+        threshold_upper, threshold_lower = _parse_rollout_is_threshold(
+            rollout_is_threshold
+        )
+        lower_for_diagnostics = (
+            1.0 / threshold_upper if threshold_lower is None else threshold_lower
+        )
+        if rollout_is == "sequence":
+            sequence_log_ratio = verl_F.masked_sum(
+                log_ratio,
+                response_mask,
+                axis=-1,
+            )
+            raw_sequence_weights = torch.exp(
+                torch.clamp(sequence_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            )
+            if threshold_lower is None:
+                applied_sequence_weights = raw_sequence_weights.clamp(max=threshold_upper)
+            else:
+                _, sequence_kept, _ = _partition_inclusive_numeric_bounds(
+                    raw_sequence_weights,
+                    lower=threshold_lower,
+                    upper=threshold_upper,
+                )
+                applied_sequence_weights = torch.where(
+                    sequence_kept,
+                    raw_sequence_weights,
+                    torch.zeros_like(raw_sequence_weights),
+                )
+            sequence_token_counts = response_mask.sum(dim=-1)
+            valid_weights = torch.repeat_interleave(
+                applied_sequence_weights[valid_sequence_mask],
+                sequence_token_counts[valid_sequence_mask].to(dtype=torch.long),
+            )
+            raw_metric_weights = raw_sequence_weights[valid_sequence_mask]
+            applied_metric_weights = applied_sequence_weights[valid_sequence_mask]
+            ratio_metric_count = valid_sequence_count
+            oob_metric_weights = torch.repeat_interleave(
+                raw_metric_weights,
+                sequence_token_counts[valid_sequence_mask].to(dtype=torch.long),
+            )
+            oob_metric_count = valid_token_count
+        else:
+            raw_token_weights = torch.exp(
+                torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            )
+            if threshold_lower is None:
+                applied_token_weights = raw_token_weights.clamp(max=threshold_upper)
+            else:
+                _, token_kept, _ = _partition_inclusive_numeric_bounds(
+                    raw_token_weights,
+                    lower=threshold_lower,
+                    upper=threshold_upper,
+                )
+                applied_token_weights = torch.where(
+                    token_kept,
+                    raw_token_weights,
+                    torch.zeros_like(raw_token_weights),
+                )
+            valid_weights = applied_token_weights[mask_bool]
+            raw_metric_weights = raw_token_weights[mask_bool]
+            applied_metric_weights = valid_weights
+            ratio_metric_count = valid_token_count
+            oob_metric_weights = raw_metric_weights
+            oob_metric_count = valid_token_count
+
+        raw_metric_low, _, raw_metric_high = _partition_inclusive_numeric_bounds(
+            raw_metric_weights,
+            lower=lower_for_diagnostics,
+            upper=threshold_upper,
+        )
+
+        if valid_weights.numel() > 0:
+            weight_mean = _exact_mean(valid_weights)
+            weight_second_moment = _exact_mean(valid_weights.square())
+            rollout_metrics["rollout_corr/rollout_is_mean"] = Metric(
+                aggregation=AggregationType.MEAN,
+                value=weight_mean,
+                weight=valid_token_count,
+            )
+            rollout_metrics["rollout_corr/rollout_is_min"] = Metric(
+                aggregation=AggregationType.MIN,
+                value=valid_weights.min().item(),
+                weight=ratio_metric_count,
+            )
+            rollout_metrics["rollout_corr/rollout_is_max"] = Metric(
+                aggregation=AggregationType.MAX,
+                value=valid_weights.max().item(),
+                weight=ratio_metric_count,
+            )
+            rollout_metrics["rollout_corr/rollout_is_std"] = Metric(
+                aggregation=AggregationType.STD,
+                value=weight_mean,
+                weight=valid_token_count,
+                second_moment=weight_second_moment,
+            )
+            rollout_metrics["rollout_corr/rollout_is_eff_sample_size"] = Metric(
+                aggregation=AggregationType.EFFECTIVE_SAMPLE_SIZE,
+                value=weight_mean,
+                weight=valid_token_count,
+                second_moment=weight_second_moment,
+            )
+
+            rollout_metrics["rollout_corr/rollout_is_ratio_fraction_high"] = Metric(
+                aggregation=AggregationType.MEAN,
+                value=int(raw_metric_high.sum().item()) / ratio_metric_count,
+                weight=ratio_metric_count,
+            )
+            rollout_metrics["rollout_corr/rollout_is_ratio_fraction_low"] = Metric(
+                aggregation=AggregationType.MEAN,
+                value=int(raw_metric_low.sum().item()) / ratio_metric_count,
+                weight=ratio_metric_count,
+            )
+            if threshold_lower is not None:
+                oob_low, _, oob_high = _partition_inclusive_numeric_bounds(
+                    oob_metric_weights,
+                    lower=threshold_lower,
+                    upper=threshold_upper,
+                )
+                rollout_metrics["rollout_corr/rollout_is_oob_ratio"] = Metric(
+                    aggregation=AggregationType.MEAN,
+                    value=int((oob_low | oob_high).sum().item()) / oob_metric_count,
+                    weight=oob_metric_count,
+                )
+
+            if rollout_is == "sequence":
+                sequence_weights = applied_metric_weights
+                raw_sequence_metric_weights = raw_metric_weights
+            else:
+                sequence_weights = (
+                    (applied_token_weights * response_mask).sum(dim=-1)
+                    / response_mask.sum(dim=-1).clamp_min(1)
+                )[valid_sequence_mask]
+                raw_sequence_metric_weights = (
+                    (raw_token_weights * response_mask).sum(dim=-1)
+                    / response_mask.sum(dim=-1).clamp_min(1)
+                )[valid_sequence_mask]
+            if sequence_weights.numel() > 0:
+                sequence_low, _, sequence_high = _partition_inclusive_numeric_bounds(
+                    raw_sequence_metric_weights,
+                    lower=lower_for_diagnostics,
+                    upper=threshold_upper,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_mean"] = Metric(
+                    aggregation=AggregationType.MEAN,
+                    value=_exact_mean(sequence_weights),
+                    weight=valid_sequence_count,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_std"] = Metric(
+                    aggregation=AggregationType.STD,
+                    value=_exact_mean(sequence_weights),
+                    weight=valid_sequence_count,
+                    second_moment=_exact_mean(sequence_weights.square()),
+                    ddof=1,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_min"] = Metric(
+                    aggregation=AggregationType.MIN,
+                    value=sequence_weights.min().item(),
+                    weight=valid_sequence_count,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_max"] = Metric(
+                    aggregation=AggregationType.MAX,
+                    value=sequence_weights.max().item(),
+                    weight=valid_sequence_count,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_max_deviation"] = Metric(
+                    aggregation=AggregationType.MAX,
+                    value=(sequence_weights - 1.0).abs().max().item(),
+                    weight=valid_sequence_count,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_fraction_high"] = Metric(
+                    aggregation=AggregationType.MEAN,
+                    value=int(sequence_high.sum().item()) / valid_sequence_count,
+                    weight=valid_sequence_count,
+                )
+                rollout_metrics["rollout_corr/rollout_is_seq_fraction_low"] = Metric(
+                    aggregation=AggregationType.MEAN,
+                    value=int(sequence_low.sum().item()) / valid_sequence_count,
+                    weight=valid_sequence_count,
+                )
+
+    actor_mask_bool = effective_mask.to(dtype=torch.bool)
+    actor_valid_token_count = int(actor_mask_bool.sum().item())
+    if actor_valid_token_count > 0 and "actor/ppo_kl" in pg_metrics:
+        pg_metrics["actor/ppo_kl"] = Metric(
+            aggregation=AggregationType.MEAN,
+            value=_exact_mean(-(log_prob - rollout_log_prob)[actor_mask_bool]),
+            weight=actor_valid_token_count,
+        )
+    for key in ("actor/pg_clipfrac", "actor/pg_clipfrac_lower"):
+        value = pg_metrics.get(key)
+        if value is not None and not isinstance(value, Metric):
+            pg_metrics[key] = Metric(
+                aggregation=AggregationType.MEAN,
+                value=value,
+                weight=actor_valid_token_count,
+            )
+
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics

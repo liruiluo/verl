@@ -94,6 +94,59 @@ def _near_boundary_batch() -> DataProto:
 
 
 class TestPaddingNativeCompatibility(TestCase):
+    def test_full_learner_batch_mode_aligns_only_to_dp_and_uses_one_global_minibatch(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.use_critic = True
+        trainer.global_steps = 0
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(critic_warmup=0, balance_batch=False),
+            actor_rollout_ref=SimpleNamespace(
+                actor=SimpleNamespace(ppo_mini_batch_size=510, ppo_epochs=1),
+                rollout=SimpleNamespace(n=1),
+            ),
+            critic=SimpleNamespace(ppo_mini_batch_size=510, ppo_epochs=2),
+            algorithm={"full_learner_batch_updates": True},
+        )
+        trainer.actor_rollout_wg = SimpleNamespace(
+            _dispatch_info={"actor": list(range(6))}
+        )
+        trainer.critic_wg = SimpleNamespace(
+            _dispatch_info={"train": list(range(6))}
+        )
+
+        batch_multiple = trainer._get_required_batch_multiple()
+        self.assertEqual(batch_multiple, 6)
+        aligned = upsample_dataproto_to_divisible_size(
+            _variable_row_batch(), batch_multiple=batch_multiple, eos_token_id=0
+        )
+        self.assertEqual(len(aligned), 1002)
+        self.assertEqual(int(aligned.non_tensor_batch["is_padding"].sum()), 1)
+        self.assertEqual(trainer._actor_update_mini_batch_size(aligned), 1002)
+        self.assertEqual(trainer._critic_update_mini_batch_size(aligned), 1002)
+
+    def test_full_learner_batch_mode_rejects_epoch_drift(self) -> None:
+        trainer = object.__new__(_local_actor_class(FullyAsyncTrainer))
+        trainer.use_critic = True
+        trainer.global_steps = 0
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(critic_warmup=0, balance_batch=False),
+            actor_rollout_ref=SimpleNamespace(
+                actor=SimpleNamespace(ppo_mini_batch_size=510, ppo_epochs=2),
+                rollout=SimpleNamespace(n=1),
+            ),
+            critic=SimpleNamespace(ppo_mini_batch_size=510, ppo_epochs=2),
+            algorithm={"full_learner_batch_updates": True},
+        )
+        trainer.actor_rollout_wg = SimpleNamespace(
+            _dispatch_info={"actor": list(range(6))}
+        )
+        trainer.critic_wg = SimpleNamespace(
+            _dispatch_info={"train": list(range(6))}
+        )
+
+        with self.assertRaisesRegex(ValueError, "actor ppo_epochs=1"):
+            trainer._get_required_batch_multiple()
+
     def test_near_boundary_padding_reuses_a_prefix_group_without_creating_eight_rows(self) -> None:
         padded = upsample_dataproto_to_divisible_size(
             _near_boundary_batch(),

@@ -23,6 +23,8 @@ class TestFSDPOptimizerConfigCPU:
         assert config.min_lr_ratio is None
         assert config.lr_scheduler_type == "constant"
         assert config.num_cycles == 0.5
+        assert config.zero_indexed_step is True
+        assert config.lr_scheduler_step_per_optimizer_step is False
 
     @pytest.mark.parametrize("lr_scheduler_type", ["constant", "cosine"])
     def test_valid_lr_scheduler_types(self, lr_scheduler_type):

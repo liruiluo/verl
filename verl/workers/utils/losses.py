@@ -183,6 +183,12 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
 
+    # Dynamic DP balancing may create an all-padding critic micro-batch.  It
+    # must remain backward-safe without contributing NaNs or zero-valued
+    # observations to cross-rank diagnostics.
+    if not response_mask.any():
+        return vpreds.sum() * 0.0, {}
+
     vf_loss, vf_clipfrac = compute_value_loss(
         vpreds=vpreds,
         values=values,
@@ -196,10 +202,19 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         loss_scale_factor=config.loss_scale_factor,
     )
 
+    valid_token_count = int(response_mask.sum().item())
     metrics = {
         "critic/vf_loss": Metric(value=vf_loss, aggregation=metric_aggregation),
-        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+        "critic/vf_clipfrac": Metric(
+            value=vf_clipfrac,
+            aggregation=AggregationType.MEAN,
+            weight=valid_token_count,
+        ),
+        "critic/vpred_mean": Metric(
+            value=masked_mean(vpreds, response_mask),
+            aggregation=AggregationType.MEAN,
+            weight=valid_token_count,
+        ),
     }
 
     return vf_loss, metrics

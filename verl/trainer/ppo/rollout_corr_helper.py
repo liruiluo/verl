@@ -129,6 +129,42 @@ def _parse_rollout_is_threshold(threshold_spec: str | float) -> tuple[float, Opt
     return upper, lower
 
 
+def _partition_inclusive_numeric_bounds(
+    values: torch.Tensor, *, lower: float, upper: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Partition finite values around tolerant inclusive numeric bounds.
+
+    Rollout ratios are reconstructed as ``exp(current_logp - rollout_logp)``.
+    Even when the mathematical ratio is exactly a configured boundary, the
+    subtract/exp round trip can land a few floating-point ulps outside it.  A
+    tiny dtype-scaled tolerance preserves the documented inclusive IcePop
+    interval without materially widening it.  Returning all three masks from
+    one comparison keeps training inclusion, OOB, and high/low diagnostics
+    mutually exclusive and exhaustive under that same tolerance.
+    """
+
+    if not values.dtype.is_floating_point:
+        raise TypeError(f"inclusive numeric bounds require floating values, got {values.dtype}")
+    eps = torch.finfo(values.dtype).eps
+    lower_t = values.new_tensor(lower)
+    upper_t = values.new_tensor(upper)
+    lower_tol = 8 * eps * torch.maximum(lower_t.abs(), values.new_tensor(1.0))
+    upper_tol = 8 * eps * torch.maximum(upper_t.abs(), values.new_tensor(1.0))
+    low_mask = values < lower_t - lower_tol
+    high_mask = values > upper_t + upper_tol
+    kept_mask = (values >= lower_t - lower_tol) & (values <= upper_t + upper_tol)
+    return low_mask, kept_mask, high_mask
+
+
+def _inside_inclusive_numeric_bounds(
+    values: torch.Tensor, *, lower: float, upper: float
+) -> torch.Tensor:
+    """Compatibility wrapper for callers that only need the kept partition."""
+
+    _, kept_mask, _ = _partition_inclusive_numeric_bounds(values, lower=lower, upper=upper)
+    return kept_mask
+
+
 def _parse_rollout_rs_thresholds(
     options: list[str], threshold_spec: Optional[str | float]
 ) -> dict[str, dict[str, Optional[float]]]:
@@ -596,8 +632,10 @@ def compute_rollout_correction_weights(
         rollout_is_weights = raw_rollout_is_weights.clamp(max=rollout_is_threshold_upper)
     else:
         assert rollout_is_threshold_lower is not None
-        token_kept_mask = (raw_rollout_is_weights >= rollout_is_threshold_lower) & (
-            raw_rollout_is_weights <= rollout_is_threshold_upper
+        token_low_mask, token_kept_mask, token_high_mask = _partition_inclusive_numeric_bounds(
+            raw_rollout_is_weights,
+            lower=rollout_is_threshold_lower,
+            upper=rollout_is_threshold_upper,
         )
         rollout_is_weights = torch.where(
             token_kept_mask, raw_rollout_is_weights, torch.zeros_like(raw_rollout_is_weights)
@@ -615,9 +653,7 @@ def compute_rollout_correction_weights(
     )
     if use_icepop:
         assert rollout_is_threshold_lower is not None
-        oob_mask = (raw_rollout_is_weights < rollout_is_threshold_lower) | (
-            raw_rollout_is_weights > rollout_is_threshold_upper
-        )
+        oob_mask = token_low_mask | token_high_mask
         metrics["rollout_is_oob_ratio"] = verl_F.masked_mean(oob_mask.float(), response_mask).item()
 
     # Detach weights to prevent gradient flow (mathematically required by IS theory)
@@ -690,52 +726,55 @@ def compute_is_metrics(
         raise ValueError("response_mask must contain at least one valid token (1).")
 
     metrics: dict[str, float] = {}
-    device: torch.device = rollout_is_weights.device
     # Default lower threshold (reciprocal of upper threshold)
     rollout_is_threshold_lower = (
         1.0 / rollout_is_threshold if rollout_is_threshold_lower is None else rollout_is_threshold_lower
     )
 
-    # Precompute log thresholds for accurate checks
-    log_threshold_upper: torch.Tensor = torch.log(torch.tensor(rollout_is_threshold, device=device))
-    log_threshold_lower: torch.Tensor = torch.log(torch.tensor(rollout_is_threshold_lower, device=device))
-
     # Compute metrics based on aggregation level
+    sequence_mask = response_mask.sum(dim=-1) > 0
+
     if rollout_is == "sequence":
         # Sequence-level aggregation: use log-space for unclamped stats
-        log_max: torch.Tensor = log_ratio_for_metrics.max()
-        log_min: torch.Tensor = log_ratio_for_metrics.min()
-        metrics["rollout_is_max"] = torch.exp(torch.clamp(log_max, max=SAFETY_BOUND)).item()
-        metrics["rollout_is_min"] = torch.exp(log_min).item()
+        valid_log_ratio = log_ratio_for_metrics.squeeze(-1)[sequence_mask]
 
         # Mean uses truncated weights to avoid overflow
         metrics["rollout_is_mean"] = verl_F.masked_mean(rollout_is_weights, response_mask).item()
 
-        # Fraction of weights exceeding thresholds (log-space for accuracy)
-        exceeds_upper: torch.Tensor = log_ratio_for_metrics > log_threshold_upper
-        below_lower: torch.Tensor = log_ratio_for_metrics < log_threshold_lower
-        metrics["rollout_is_ratio_fraction_high"] = exceeds_upper.float().mean().item()
-        metrics["rollout_is_ratio_fraction_low"] = below_lower.float().mean().item()
+        # Use the same tolerant numeric partition as IcePop training and OOB.
+        valid_raw_weights = torch.exp(torch.clamp(valid_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND))
+        low_mask, _, high_mask = _partition_inclusive_numeric_bounds(
+            valid_raw_weights,
+            lower=rollout_is_threshold_lower,
+            upper=rollout_is_threshold,
+        )
+        metrics["rollout_is_ratio_fraction_high"] = high_mask.float().mean().item()
+        metrics["rollout_is_ratio_fraction_low"] = low_mask.float().mean().item()
 
     else:  # token-level
         # Token-level aggregation: the applied weights drive loss, std, and ESS,
         # while high/low fractions are measured from the raw pre-processing weights.
         metrics["rollout_is_mean"] = verl_F.masked_mean(rollout_is_weights, response_mask).item()
 
-        # Fraction of tokens exceeding thresholds
-        rollout_is_above_threshold: torch.Tensor = raw_rollout_is_weights > rollout_is_threshold
-        rollout_is_below_threshold: torch.Tensor = raw_rollout_is_weights < rollout_is_threshold_lower
+        # Fraction of tokens in the same low/kept/high numeric partition.
+        token_low_mask, _, token_high_mask = _partition_inclusive_numeric_bounds(
+            raw_rollout_is_weights,
+            lower=rollout_is_threshold_lower,
+            upper=rollout_is_threshold,
+        )
         metrics["rollout_is_ratio_fraction_high"] = verl_F.masked_mean(
-            rollout_is_above_threshold.float(), response_mask
+            token_high_mask.float(), response_mask
         ).item()
         metrics["rollout_is_ratio_fraction_low"] = verl_F.masked_mean(
-            rollout_is_below_threshold.float(), response_mask
+            token_low_mask.float(), response_mask
         ).item()
 
-        # Max/min (mask out padding tokens)
-        mask_bool: torch.Tensor = response_mask.bool()
-        metrics["rollout_is_max"] = rollout_is_weights.masked_fill(~mask_bool, float("-inf")).max().item()
-        metrics["rollout_is_min"] = rollout_is_weights.masked_fill(~mask_bool, float("inf")).min().item()
+    # Generic weight statistics always describe the coefficients actually
+    # applied to the loss.  Raw pre-IcePop ratios remain available through the
+    # explicit high/low and OOB diagnostics above.
+    mask_bool: torch.Tensor = response_mask.bool()
+    metrics["rollout_is_max"] = rollout_is_weights.masked_fill(~mask_bool, float("-inf")).max().item()
+    metrics["rollout_is_min"] = rollout_is_weights.masked_fill(~mask_bool, float("inf")).min().item()
 
     # Compute standard deviation / ESS from the actual applied weights so exact
     # IcePop diagnostics preserve zeroed-out coefficients.
@@ -752,15 +791,22 @@ def compute_is_metrics(
 
     # Compute Effective Sample Size (ESS) for truncated weights
     weights_for_ess: torch.Tensor = rollout_is_weights.clamp(min=0.0, max=rollout_is_threshold)
-    mean_for_ess: torch.Tensor = verl_F.masked_mean(weights_for_ess, response_mask)
-    is_weights_normalized: torch.Tensor = weights_for_ess / (mean_for_ess + 1e-8)  # Avoid division by zero
-    metrics["rollout_is_eff_sample_size"] = (
-        1.0 / verl_F.masked_mean(is_weights_normalized.square(), response_mask).item()
-    )
+    valid_weights_for_ess = weights_for_ess[response_mask.to(dtype=torch.bool)]
+    mean_for_ess = valid_weights_for_ess.mean()
+    second_moment_for_ess = valid_weights_for_ess.square().mean()
+    if second_moment_for_ess.item() <= 0.0:
+        # A valid micro-batch may have every ratio outside the IcePop band.
+        # That is zero effective sample mass, not an arithmetic failure.
+        metrics["rollout_is_eff_sample_size"] = 0.0
+    else:
+        metrics["rollout_is_eff_sample_size"] = (
+            mean_for_ess.square() / second_moment_for_ess
+        ).item()
 
     # Add sequence-level metrics if weights have batch dimension
     if rollout_is_weights.dim() > 1:
         seq_mean_weights: torch.Tensor = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+        seq_mean_weights = seq_mean_weights[sequence_mask]
 
         metrics["rollout_is_seq_mean"] = seq_mean_weights.mean().item()
         metrics["rollout_is_seq_std"] = seq_mean_weights.std().item() if seq_mean_weights.numel() > 1 else 0.0
@@ -774,11 +820,18 @@ def compute_is_metrics(
         # Fraction of sequences with extreme weights. Use the raw (pre-truncation)
         # per-sequence mean: every clamped weight is <= rollout_is_threshold, so a mean
         # of clamped weights can never exceed it and the high fraction would be dead.
-        raw_seq_mean_weights: torch.Tensor = verl_F.masked_mean(raw_rollout_is_weights, response_mask, axis=-1)
-        metrics["rollout_is_seq_fraction_high"] = (raw_seq_mean_weights > rollout_is_threshold).float().mean().item()
-        metrics["rollout_is_seq_fraction_low"] = (
-            (raw_seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
+        raw_seq_mean_weights: torch.Tensor = (
+            (raw_rollout_is_weights * response_mask).sum(dim=-1)
+            / response_mask.sum(dim=-1).clamp_min(1)
         )
+        raw_seq_mean_weights = raw_seq_mean_weights[sequence_mask]
+        seq_low_mask, _, seq_high_mask = _partition_inclusive_numeric_bounds(
+            raw_seq_mean_weights,
+            lower=rollout_is_threshold_lower,
+            upper=rollout_is_threshold,
+        )
+        metrics["rollout_is_seq_fraction_high"] = seq_high_mask.float().mean().item()
+        metrics["rollout_is_seq_fraction_low"] = seq_low_mask.float().mean().item()
 
     return metrics
 
@@ -944,7 +997,8 @@ def compute_offpolicy_metrics(
     # 1. Training policy perplexity (always available)
     # Formula: exp(-1/|T| * Σ log π_training(y_t|y_<t))
     # where |T| is the number of tokens generated by the model
-    mean_log_prob_training = verl_F.masked_mean(old_log_prob, response_mask, axis=-1)  # (batch_size,)
+    sequence_mask = response_mask.sum(dim=-1) > 0
+    mean_log_prob_training = verl_F.masked_mean(old_log_prob, response_mask, axis=-1)[sequence_mask]
     training_ppl = torch.exp(-mean_log_prob_training).mean()  # Batch mean of per-sequence PPL
     metrics["training_ppl"] = training_ppl.detach().item()
 
@@ -966,7 +1020,7 @@ def compute_offpolicy_metrics(
         metrics["k3_kl"] = verl_F.masked_mean(k3_kl_matrix, response_mask).detach().item()
 
         # 2c. Rollout policy perplexity
-        mean_log_prob_rollout = verl_F.masked_mean(rollout_log_prob, response_mask, axis=-1)  # (batch_size,)
+        mean_log_prob_rollout = verl_F.masked_mean(rollout_log_prob, response_mask, axis=-1)[sequence_mask]
         rollout_ppl = torch.exp(-mean_log_prob_rollout).mean()  # Batch mean of per-sequence PPL
         metrics["rollout_ppl"] = rollout_ppl.detach().item()
         metrics["rollout_log_ppl"] = (-mean_log_prob_rollout).mean().detach().item()
@@ -1001,7 +1055,7 @@ def compute_offpolicy_metrics(
         metrics["chi2_token"] = chi2_token.detach().item()
 
         # Sequence-level: E_seq[(Π ρ_t)²] - 1 = E_seq[exp(2 * Σ log ρ_t)] - 1
-        log_ratio_sum = verl_F.masked_sum(log_ratio, response_mask, axis=-1)  # Σ log ρ_t per sequence
+        log_ratio_sum = verl_F.masked_sum(log_ratio, response_mask, axis=-1)[sequence_mask]
         log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         rho_squared_seq = torch.exp(2.0 * log_ratio_sum_safe)  # (Π ρ_t)²
         chi2_seq = rho_squared_seq.mean() - 1.0

@@ -1395,6 +1395,25 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    def _actor_update_mini_batch_size(self, batch: DataProto) -> int:
+        """Return the global actor mini-batch size for this learner batch.
+
+        Subclasses may override the update boundary while retaining the native
+        actor worker, loss, and dynamic micro-batching implementation.
+        """
+
+        del batch
+        return (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            * self.config.actor_rollout_ref.rollout.n
+        )
+
+    def _critic_update_mini_batch_size(self, batch: DataProto) -> int:
+        """Return the global critic mini-batch size for this learner batch."""
+
+        del batch
+        return self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1420,8 +1439,7 @@ class RayPPOTrainer:
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_mini_batch_size = self._actor_update_mini_batch_size(batch)
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1450,8 +1468,7 @@ class RayPPOTrainer:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
-        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_mini_batch_size = self._critic_update_mini_batch_size(batch)
         ppo_epochs = self.config.critic.ppo_epochs
         seed = self.config.critic.data_loader_seed
         shuffle = self.config.critic.shuffle

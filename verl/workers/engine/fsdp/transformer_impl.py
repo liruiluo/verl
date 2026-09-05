@@ -76,6 +76,14 @@ from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, pad_packed_inputs, postprocess_batch_func, prepare_micro_batches
+from .parameter_freeze import (
+    ParameterFreezePolicyError,
+    begin_first_optimizer_step_probe,
+    configure_parameter_freeze_policy,
+    finalize_optimizer_membership,
+    finish_first_optimizer_step_probe,
+    record_optimizer_step_learning_rates,
+)
 from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
@@ -149,6 +157,8 @@ class FSDPEngine(BaseEngine):
         # defaults so forward_step / optimizer_step can still read them safely.
         self._autocast_dtype = torch.bfloat16
         self.scaler = None
+        self._parameter_freeze_runtime = None
+        self._optimizer_steps_completed = 0
 
         # QAT (Quantization-Aware Training)
         self._qat_config = getattr(self.engine_config, "qat", None)
@@ -177,6 +187,12 @@ class FSDPEngine(BaseEngine):
     @property
     def is_optimizer_offload_enabled(self) -> bool:
         return self._is_offload_optimizer
+
+    @property
+    def optimizer_steps_completed(self) -> int:
+        """Number of optimizer steps that actually executed in this engine process."""
+
+        return getattr(self, "_optimizer_steps_completed", 0)
 
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
@@ -477,7 +493,16 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        parameter_freeze_runtime = getattr(self, "_parameter_freeze_runtime", None)
+        parameters = module.parameters()
+        if parameter_freeze_runtime is not None:
+            parameters = [parameter for parameter in parameters if parameter.requires_grad]
+            if not parameters:
+                raise ParameterFreezePolicyError("parameter freeze policy produced no trainable parameters")
+
+        optimizer = build_optimizer(parameters, self.optimizer_config)
+        if parameter_freeze_runtime is not None:
+            finalize_optimizer_membership(parameter_freeze_runtime, module, optimizer)
 
         return optimizer
 
@@ -500,7 +525,11 @@ class FSDPEngine(BaseEngine):
             print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
 
         if lr_scheduler_type == "constant":
-            lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
+            lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                zero_indexed_step=zero_indexed_step,
+            )
         elif lr_scheduler_type == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
@@ -569,6 +598,21 @@ class FSDPEngine(BaseEngine):
     def _build_model_optimizer(self):
         from verl.utils.model import print_model_size
 
+        parameter_freeze_policy = getattr(self.model_config, "parameter_freeze_policy", None)
+        if parameter_freeze_policy is not None:
+            if self.engine_config.forward_only:
+                raise ParameterFreezePolicyError("parameter freeze policy cannot run in a forward-only engine")
+            if self._is_lora:
+                raise ParameterFreezePolicyError("parameter freeze policy does not support LoRA-wrapped value models")
+            if self._qat_enabled:
+                raise ParameterFreezePolicyError(
+                    "parameter freeze policy does not support QAT-transformed value models"
+                )
+            if self.engine_config.strategy == "fsdp" and not self.engine_config.use_orig_params:
+                raise ParameterFreezePolicyError(
+                    "FSDP1 requires use_orig_params=true for mixed frozen/trainable parameters"
+                )
+
         # Load base model with specified configuration and dtype
         module = self._build_module()
         try:
@@ -582,6 +626,23 @@ class FSDPEngine(BaseEngine):
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
+
+        self._parameter_freeze_runtime = configure_parameter_freeze_policy(
+            module,
+            policy=parameter_freeze_policy,
+            manifest_path=getattr(self.model_config, "parameter_freeze_manifest_path", None),
+            probe_elements_per_rank=getattr(
+                self.model_config,
+                "parameter_freeze_probe_elements_per_rank",
+                4096,
+            ),
+            model_role=self.model_config.model_type,
+            hf_config=self.model_config.hf_config,
+            model_path=self.model_config.path,
+            loader_path=self.model_config.local_path,
+            loader_entrypoint="verl.utils.model.load_valuehead_model",
+            rank=self.rank,
+        )
 
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
@@ -790,17 +851,56 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        gradients_are_finite = bool(torch.isfinite(grad_norm).item())
+        parameter_freeze_runtime = getattr(self, "_parameter_freeze_runtime", None)
+        first_step_probe = None
+        if (
+            gradients_are_finite
+            and parameter_freeze_runtime is not None
+            and parameter_freeze_runtime.optimizer_steps_completed == 0
+        ):
+            first_step_probe = begin_first_optimizer_step_probe(parameter_freeze_runtime, self.module)
+        learning_rates = [float(group["lr"]) for group in self.optimizer.param_groups]
+        optimizer_step_executed = False
+
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
-            scaler.step(self.optimizer)
+            def mark_optimizer_step(_optimizer, _args, _kwargs):
+                nonlocal optimizer_step_executed
+                optimizer_step_executed = True
+
+            step_hook = self.optimizer.register_step_post_hook(mark_optimizer_step)
+            try:
+                scaler.step(self.optimizer)
+            finally:
+                step_hook.remove()
             scaler.update()
         else:
             # if grad_norm is not finite, skip the update
-            if not torch.isfinite(grad_norm):
+            if not gradients_are_finite:
                 print(f"WARN: grad_norm is not finite: {grad_norm}")
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+                optimizer_step_executed = True
+
+        if optimizer_step_executed:
+            self._optimizer_steps_completed = getattr(self, "_optimizer_steps_completed", 0) + 1
+            if parameter_freeze_runtime is not None:
+                parameter_freeze_runtime.optimizer_steps_completed += 1
+                if first_step_probe is not None:
+                    finish_first_optimizer_step_probe(
+                        parameter_freeze_runtime,
+                        first_step_probe,
+                        completed_step=parameter_freeze_runtime.optimizer_steps_completed,
+                        learning_rates=learning_rates,
+                    )
+                else:
+                    record_optimizer_step_learning_rates(
+                        parameter_freeze_runtime,
+                        completed_step=parameter_freeze_runtime.optimizer_steps_completed,
+                        learning_rates=learning_rates,
+                    )
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

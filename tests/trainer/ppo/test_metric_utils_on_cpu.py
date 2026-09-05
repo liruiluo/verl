@@ -243,15 +243,55 @@ class TestMetric(unittest.TestCase):
         self.assertEqual(result, 1.0)
 
     def test_aggregate_dp_mismatched_lengths(self):
-        """Test aggregate_dp raises error with mismatched value lengths."""
+        """DP aggregation skips absent synthetic-padding observations."""
         metric1 = Metric(aggregation="sum")
         metric1.extend([1.0, 2.0])
 
         metric2 = Metric(aggregation="sum")
-        metric2.extend([3.0, 4.0, 5.0])  # Different length
+        metric2.extend([3.0])
 
-        with self.assertRaises(ValueError):
-            Metric.aggregate_dp([metric1, metric2])
+        # SUM metrics are already normalized for DDP and therefore retain the
+        # fixed rank denominator even when one rank has fewer valid dynamic
+        # micro-batches: ((1 + 2) + 3) / 2 = 3.
+        self.assertEqual(Metric.aggregate_dp([metric1, metric2]), 3.0)
+
+        mean1 = Metric(aggregation="mean")
+        mean1.append(2.0, weight=2)
+        mean1.append(8.0, weight=1)
+        mean2 = Metric(aggregation="mean")
+        mean2.append(4.0, weight=3)
+        self.assertEqual(Metric.aggregate_dp([mean1, mean2]), 4.0)
+
+    def test_zero_weight_values_do_not_pollute_mean_min_or_max(self):
+        valid = Metric(aggregation="mean", value=3.0, weight=2)
+        padding = Metric(aggregation="mean", value=0.0, weight=0)
+        self.assertEqual(Metric.aggregate_dp([valid, padding]), 3.0)
+
+        valid_min = Metric(aggregation="min", value=3.0, weight=2)
+        padding_min = Metric(aggregation="min", value=0.0, weight=0)
+        self.assertEqual(Metric.aggregate_dp([valid_min, padding_min]), 3.0)
+
+        valid_max = Metric(aggregation="max", value=3.0, weight=2)
+        padding_max = Metric(aggregation="max", value=99.0, weight=0)
+        self.assertEqual(Metric.aggregate_dp([valid_max, padding_max]), 3.0)
+
+    def test_pooled_std_and_effective_sample_size_use_sufficient_statistics(self):
+        # Raw values [1, 3] and [5] have mean=3, population std=sqrt(8/3),
+        # and normalized ESS=(sum w)^2/(N*sum w^2)=81/(3*35).
+        std1 = Metric(aggregation="std", value=2.0, weight=2, second_moment=5.0)
+        std2 = Metric(aggregation="std", value=5.0, weight=1, second_moment=25.0)
+        self.assertAlmostEqual(Metric.aggregate_dp([std1, std2]), np.sqrt(8.0 / 3.0))
+
+        ess1 = Metric(aggregation="effective_sample_size", value=2.0, weight=2, second_moment=5.0)
+        ess2 = Metric(aggregation="effective_sample_size", value=5.0, weight=1, second_moment=25.0)
+        self.assertAlmostEqual(Metric.aggregate_dp([ess1, ess2]), 81.0 / 105.0)
+
+    def test_from_dict_preserves_preaggregated_metric(self):
+        source = Metric(aggregation="max", value=7.0, weight=3)
+        metrics = Metric.from_dict({"peak": source}, aggregation="mean")
+        self.assertEqual(metrics["peak"].aggregation, AggregationType.MAX)
+        self.assertEqual(metrics["peak"].values, [7.0])
+        self.assertEqual(metrics["peak"].weights, [3.0])
 
     def test_from_dict(self):
         """Test from_dict creates Metrics from dictionary."""

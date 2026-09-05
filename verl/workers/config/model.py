@@ -117,6 +117,13 @@ class HFModelConfig(BaseConfig):
     enable_gradient_checkpointing: bool = True
     enable_activation_offload: bool = False
 
+    # Optional fail-closed parameter-freezing policy for value models. The
+    # policy implementation owns validation of the model family and parameter
+    # taxonomy; these fields expose its runtime contract to the engine.
+    parameter_freeze_policy: Optional[str] = None
+    parameter_freeze_manifest_path: Optional[str] = None
+    parameter_freeze_probe_elements_per_rank: int = 4096
+
     use_remove_padding: bool = True
 
     # TODO: unify fsdp and megatron lora config

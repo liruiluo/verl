@@ -30,6 +30,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from transformers import PreTrainedTokenizer
 
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.metric import Metric
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -468,15 +469,25 @@ def allgather_dict_into_dict(data: dict, group=None) -> dict:
 
     group_size = torch.distributed.get_world_size(group=group)
 
-    final_metrics = {}
     all_metrics_lst = [None for _ in range(group_size)]
     torch.distributed.all_gather_object(all_metrics_lst, data, group=group)
 
-    for all_metrics in all_metrics_lst:
-        for key, val in all_metrics.items():
-            if key not in final_metrics:
-                final_metrics[key] = []
-            final_metrics[key].append(val)
+    final_metrics = {}
+    all_keys = dict.fromkeys(key for metrics in all_metrics_lst for key in metrics)
+    for key in all_keys:
+        present_values = [metrics[key] for metrics in all_metrics_lst if key in metrics]
+        metric_values = [value for value in present_values if isinstance(value, Metric)]
+        if metric_values:
+            if len(metric_values) != len(present_values):
+                raise TypeError(f"metric key {key!r} mixes Metric and non-Metric values across ranks")
+            prototype = metric_values[0]
+            final_metrics[key] = [
+                metrics[key] if key in metrics else prototype.init_list()
+                for metrics in all_metrics_lst
+            ]
+        else:
+            # Preserve the historical sparse-list behavior for non-Metric data.
+            final_metrics[key] = present_values
     return final_metrics
 
 
@@ -769,6 +780,7 @@ def get_constant_schedule_with_warmup(
     optimizer: Optimizer,
     num_warmup_steps: int,
     last_epoch: int = -1,
+    zero_indexed_step: bool = True,
 ):
     """
     Create a constant LR schedule with a linear warmup phase.
@@ -777,12 +789,17 @@ def get_constant_schedule_with_warmup(
         optimizer (Optimizer): Wrapped optimizer.
         num_warmup_steps (int): Number of steps to ramp up the LR from 0 to initial value.
         last_epoch (int, optional): The index of the last epoch when resuming training. Defaults to -1.
+        zero_indexed_step (bool, optional): Keep the historical zero-LR first
+            optimizer step when True.  When False, warmup is indexed by the
+            upcoming optimizer step, so step 1 uses ``1 / num_warmup_steps``.
 
     Returns:
         LambdaLR: Scheduler that increases LR linearly during warmup, then holds it constant.
     """
 
     def lr_lambda(current_step):
+        if not zero_indexed_step:
+            current_step += 1
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1.0, num_warmup_steps))
         return 1.0

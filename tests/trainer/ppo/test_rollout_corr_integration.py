@@ -13,11 +13,16 @@
 # limitations under the License.
 """Integration tests for Rollout Correction."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
-from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+from verl.trainer.ppo.core_algos import (
+    compute_policy_loss_bypass_mode,
+    compute_policy_loss_vanilla,
+)
 from verl.trainer.ppo.rollout_corr_helper import (
     compute_offpolicy_metrics,
     compute_rollout_correction_and_rejection_mask,
@@ -267,6 +272,90 @@ class TestRolloutISIntegration:
         assert metrics["rollout_corr/rollout_is_oob_ratio"] == pytest.approx(1.0 / 3.0, abs=1e-6)
         torch.testing.assert_close(rollout_is_weights, expected_weights, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(pg_loss, expected_loss, atol=1e-6, rtol=1e-6)
+
+    def test_rollout_metrics_ignore_zero_mask_synthetic_rows(self):
+        """A DP-alignment row must not change token or sequence diagnostics."""
+        old_log_prob = torch.tensor(
+            [[-1.0, -1.4, -0.8], [-0.6, -1.2, -2.0]], dtype=torch.float64
+        )
+        rollout_log_prob = torch.tensor(
+            [[-1.2, -1.1, -1.0], [-0.4, -1.5, -1.7]], dtype=torch.float64
+        )
+        response_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.float64)
+
+        _, _, expected = compute_rollout_correction_and_rejection_mask(
+            old_log_prob=old_log_prob,
+            rollout_log_prob=rollout_log_prob,
+            response_mask=response_mask,
+            rollout_is="token",
+            rollout_is_threshold="0.2_4.0",
+            rollout_rs=None,
+        )
+
+        padded_old = torch.cat([old_log_prob, torch.zeros((1, 3), dtype=old_log_prob.dtype)])
+        padded_rollout = torch.cat(
+            [rollout_log_prob, torch.zeros((1, 3), dtype=rollout_log_prob.dtype)]
+        )
+        padded_mask = torch.cat(
+            [response_mask, torch.zeros((1, 3), dtype=response_mask.dtype)]
+        )
+        _, _, actual = compute_rollout_correction_and_rejection_mask(
+            old_log_prob=padded_old,
+            rollout_log_prob=padded_rollout,
+            response_mask=padded_mask,
+            rollout_is="token",
+            rollout_is_threshold="0.2_4.0",
+            rollout_rs=None,
+        )
+
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            assert actual[key] == pytest.approx(expected[key], rel=1e-12, abs=1e-12), key
+
+    def test_sequence_icepop_metrics_match_applied_loss_weights(self):
+        """Rejected sequence weights must not leak into generic min/max."""
+        ratios = torch.tensor([[0.25], [1.0], [4.0]], dtype=torch.float64)
+        current_log_prob = torch.log(ratios).detach().requires_grad_(True)
+        config = SimpleNamespace(
+            clip_ratio=0.2,
+            clip_ratio_low=0.2,
+            clip_ratio_high=0.2,
+            clip_ratio_c=3.0,
+            global_batch_info={
+                "dp_size": 1,
+                "batch_num_tokens": None,
+                "global_batch_size": None,
+            },
+            policy_loss={
+                "rollout_correction": {
+                    "loss_type": "reinforce",
+                    "rollout_is": "sequence",
+                    "rollout_is_threshold": "0.5_2.0",
+                    "rollout_is_batch_normalize": False,
+                    "rollout_rs": None,
+                    "rollout_rs_threshold": None,
+                }
+            },
+        )
+
+        loss, metrics = compute_policy_loss_bypass_mode(
+            old_log_prob=torch.zeros_like(ratios),
+            log_prob=current_log_prob,
+            advantages=torch.ones_like(ratios),
+            response_mask=torch.ones_like(ratios),
+            loss_agg_mode="token-mean",
+            config=config,
+        )
+        loss.backward()
+
+        assert metrics["rollout_corr/rollout_is_min"].aggregate() == pytest.approx(0.0)
+        assert metrics["rollout_corr/rollout_is_max"].aggregate() == pytest.approx(1.0)
+        assert metrics["rollout_corr/rollout_is_seq_min"].aggregate() == pytest.approx(0.0)
+        assert metrics["rollout_corr/rollout_is_seq_max"].aggregate() == pytest.approx(1.0)
+        torch.testing.assert_close(
+            current_log_prob.grad,
+            torch.tensor([[0.0], [-1.0 / 3.0], [0.0]], dtype=torch.float64),
+        )
 
 
 class TestRolloutCorrectionConfigNormalization:

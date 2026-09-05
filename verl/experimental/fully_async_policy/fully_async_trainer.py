@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -700,6 +701,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """
 
         rollout_n = self.config.actor_rollout_ref.rollout.n
+        full_batch_updates = self._full_learner_batch_updates_enabled()
         actor_active = self.config.trainer.critic_warmup <= self.global_steps
         active_role_contracts: list[tuple[str, int, int]] = []
 
@@ -726,6 +728,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if not active_role_contracts:
             raise ValueError("fully-async learner has no active actor or critic role")
 
+        if full_batch_updates:
+            if actor_active and self.config.actor_rollout_ref.actor.ppo_epochs != 1:
+                raise ValueError(
+                    "full learner-batch actor updates require actor ppo_epochs=1"
+                )
+            if self.use_critic and self.config.critic.ppo_epochs != 2:
+                raise ValueError(
+                    "full learner-batch SAO updates require critic ppo_epochs=2"
+                )
+            # The runtime mini-batch is the complete aligned learner batch for
+            # both roles.  Only data-parallel divisibility requires synthetic
+            # rows; FSDP dynamic micro-batching remains the memory boundary.
+            return math.lcm(*(dp_size for _, _, dp_size in active_role_contracts))
+
         active_mini_batch_sizes = {mini_batch_size for _, mini_batch_size, _ in active_role_contracts}
         if len(active_mini_batch_sizes) != 1:
             details = ", ".join(f"{role}={mini_batch_size}" for role, mini_batch_size, _ in active_role_contracts)
@@ -739,6 +755,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # preserves ceil(real_rows / mini_batch_size) optimizer steps for every
         # role; an LCM of different role mini-batches would not.
         return active_role_contracts[0][1]
+
+    def _full_learner_batch_updates_enabled(self) -> bool:
+        algorithm = getattr(self.config, "algorithm", None)
+        if algorithm is None:
+            return False
+        if hasattr(algorithm, "get"):
+            return bool(algorithm.get("full_learner_batch_updates", False))
+        return bool(getattr(algorithm, "full_learner_batch_updates", False))
+
+    def _actor_update_mini_batch_size(self, batch: DataProto) -> int:
+        if self._full_learner_batch_updates_enabled():
+            return len(batch)
+        return super()._actor_update_mini_batch_size(batch)
+
+    def _critic_update_mini_batch_size(self, batch: DataProto) -> int:
+        if self._full_learner_batch_updates_enabled():
+            return len(batch)
+        return super()._critic_update_mini_batch_size(batch)
 
     def _validate_synthetic_padding_contract(self, batch: DataProto, batch_multiple: int) -> None:
         """Reject configurations where zero-mask rows are not optimizer-neutral."""
@@ -817,14 +851,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
 
     def _update_critic(self, batch: DataProto) -> DataProto:
-        critic_mini_batch_size = self.config.critic.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        critic_mini_batch_size = self._critic_update_mini_batch_size(batch)
         self._assert_role_batch_alignment(batch, critic_mini_batch_size, "critic")
         return super()._update_critic(batch)
 
     def _update_actor(self, batch: DataProto) -> DataProto:
-        actor_mini_batch_size = (
-            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        )
+        actor_mini_batch_size = self._actor_update_mini_batch_size(batch)
         self._assert_role_batch_alignment(batch, actor_mini_batch_size, "actor")
         return super()._update_actor(batch)
 

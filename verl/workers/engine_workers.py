@@ -258,6 +258,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
 
         assert mini_batch_size is not None or num_mini_batch is not None
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError(f"epochs must be a positive integer, got {epochs!r}")
 
         if mini_batch_size is None:
             assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
@@ -283,40 +285,94 @@ class TrainingWorker(Worker, DistProfilerExtension):
         ):
             # update
             output_lst = []
-            total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
-
-            for batch_idx, mini_batch_td in enumerate(dataloader):
-                maybe_fix_3d_position_ids(mini_batch_td)
-                # add global token num
-                if "input_ids" in mini_batch_td:
-                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
-                    # allgather from dp rank
-                    global_token_num_output = [None] * torch.distributed.get_world_size(
-                        self.engine.get_data_parallel_group()
-                    )
-                    torch.distributed.all_gather_object(
-                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
-                    )
-                    global_token_num = [x for xs in global_token_num_output for x in xs]
-                else:
-                    global_token_num = None
-
-                tu.assign_non_tensor(
-                    mini_batch_td,
-                    global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
-                    disable_auto_offload=True,
+            mini_batches_per_epoch = data.shape[0] // mini_batch_size_per_gpu
+            total_num_iterations = mini_batches_per_epoch * epochs
+            completed_train_batch_calls = 0
+            optimizer_steps_delta = 0
+            scheduler_per_optimizer_step = bool(
+                getattr(
+                    getattr(self, "optimizer_config", None),
+                    "lr_scheduler_step_per_optimizer_step",
+                    False,
                 )
-                # Name the mini-batch in the trace so each iteration of this otherwise identical
-                # loop is distinguishable when the whole step is recorded (continuous mode).
-                with torch.profiler.record_function(f"mini_batch{batch_idx}"):
-                    actor_output = self.train_batch(mini_batch_td)
-                # Advance the profiler once per mini-batch. This drives any
-                # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
-                # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
-                # happen on the outer worker, but the profiler is process-global so this reaches it.
-                self.profiler.step()
-                output_lst.append(actor_output)
+            )
+
+            # ``train_batch`` returning only proves that the forward/backward
+            # call completed.  In mixed precision an optimizer update can
+            # still be skipped (for example when GradScaler observes an
+            # overflow).  Count the optimizer's actual successful ``step``
+            # calls through PyTorch's post-step hook instead of inferring K
+            # from either the static config or the number of mini-batches.
+            optimizer = getattr(self.engine, "optimizer", None)
+            register_step_post_hook = getattr(
+                optimizer, "register_step_post_hook", None
+            )
+            if not callable(register_step_post_hook):
+                raise RuntimeError(
+                    "training engine optimizer must support an actual-step "
+                    "post hook for fail-closed PPO execution accounting"
+                )
+
+            def _count_successful_optimizer_step(_optimizer, _args, _kwargs):
+                nonlocal optimizer_steps_delta
+                optimizer_steps_delta += 1
+
+            optimizer_step_hook = register_step_post_hook(
+                _count_successful_optimizer_step
+            )
+
+            try:
+                for batch_idx, mini_batch_td in enumerate(dataloader):
+                    maybe_fix_3d_position_ids(mini_batch_td)
+                    # add global token num
+                    if "input_ids" in mini_batch_td:
+                        global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+                        # allgather from dp rank
+                        global_token_num_output = [None] * torch.distributed.get_world_size(
+                            self.engine.get_data_parallel_group()
+                        )
+                        torch.distributed.all_gather_object(
+                            global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+                        )
+                        global_token_num = [x for xs in global_token_num_output for x in xs]
+                    else:
+                        global_token_num = None
+
+                    tu.assign_non_tensor(
+                        mini_batch_td,
+                        global_token_num=NonTensorData(global_token_num),
+                        update_lr_scheduler=(
+                            scheduler_per_optimizer_step
+                            or batch_idx == total_num_iterations - 1
+                        ),
+                        disable_auto_offload=True,
+                    )
+                    # Name the mini-batch in the trace so each iteration of this otherwise identical
+                    # loop is distinguishable when the whole step is recorded (continuous mode).
+                    with torch.profiler.record_function(f"mini_batch{batch_idx}"):
+                        actor_output = self.train_batch(mini_batch_td)
+                    completed_train_batch_calls += 1
+                    # Advance the profiler once per mini-batch. This drives any
+                    # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
+                    # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
+                    # happen on the outer worker, but the profiler is process-global so this reaches it.
+                    self.profiler.step()
+                    output_lst.append(actor_output)
+            finally:
+                optimizer_step_hook.remove()
+
+            if completed_train_batch_calls != total_num_iterations:
+                raise RuntimeError(
+                    "training iterator completed an unexpected number of train-batch "
+                    f"calls: actual={completed_train_batch_calls}, "
+                    f"expected={total_num_iterations}"
+                )
+            if optimizer_steps_delta != total_num_iterations:
+                raise RuntimeError(
+                    "training loop completed an unexpected number of successful "
+                    f"optimizer steps: actual={optimizer_steps_delta}, "
+                    f"expected={total_num_iterations}"
+                )
 
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in output_lst]
@@ -331,6 +387,19 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
+
+                # Metric preserves the intended reduction when outputs from
+                # several DP source ranks are collected: counts are averaged
+                # across identical ranks, then summed across local iterations.
+                metrics["ppo_epoch_passes_delta"] = Metric(
+                    aggregation="sum", value=epochs
+                )
+                metrics["mini_batches_per_epoch"] = Metric(
+                    aggregation="mean", value=mini_batches_per_epoch
+                )
+                metrics["optimizer_steps_delta"] = Metric(
+                    aggregation="sum", value=optimizer_steps_delta
+                )
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:

@@ -41,6 +41,10 @@ lr_scheduler_type: constant
 # Whether the LR schedule uses 0-indexed steps
 zero_indexed_step: true
 
+# Whether to advance LR after each optimizer step inside train_mini_batch.
+# False preserves the upstream one-scheduler-step-per-worker-call behavior.
+lr_scheduler_step_per_optimizer_step: false
+
 # deprecated
 warmup_style: null
 

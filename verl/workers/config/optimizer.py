@@ -112,6 +112,11 @@ class FSDPOptimizerConfig(OptimizerConfig):
     num_cycles: float = 0.5
     override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
+    # Advance the scheduler after every successful optimizer step rather than
+    # once after the full worker train_mini_batch call.  This is required when
+    # multiple optimizer epochs (for example SAO's K=2 critic) intentionally
+    # occur inside one learner publication boundary.
+    lr_scheduler_step_per_optimizer_step: bool = False
 
     def __post_init__(self):
         if self.warmup_style is not None:

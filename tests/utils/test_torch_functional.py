@@ -20,13 +20,74 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
+from verl.utils.metric import Metric
 from verl.utils.torch_functional import (
+    allgather_dict_into_dict,
     calculate_sum_pi_squared_from_logits,
     distributed_masked_mean,
     distributed_mean_max_min_std,
     expand_as_nested,
+    get_constant_schedule_with_warmup,
     masked_mean,
 )
+
+
+def test_constant_warmup_can_start_at_first_optimizer_step():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = get_constant_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=10,
+        zero_indexed_step=False,
+    )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    observed = []
+    for _ in range(2):
+        observed.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+    assert observed == pytest.approx([0.1, 0.2])
+
+
+def test_constant_warmup_default_preserves_zero_indexed_behavior():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    get_constant_schedule_with_warmup(optimizer, num_warmup_steps=10)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.0)
+
+
+def _worker_allgather_missing_metric(rank: int, world_size: int, rendezvous_file: str):
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        local_metrics = (
+            {"critic/vf_loss": Metric(aggregation="sum", value=2.0)}
+            if rank == 0
+            else {}
+        )
+        gathered = allgather_dict_into_dict(local_metrics)
+        values = gathered["critic/vf_loss"]
+        assert len(values) == world_size
+        assert values[0].values == [2.0]
+        assert values[1].values == []
+        assert Metric.aggregate_dp(values) == pytest.approx(1.0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_allgather_missing_metric_preserves_fixed_dp_denominator(tmp_path):
+    rendezvous_file = str(tmp_path / "rdzv_missing_metric")
+    mp.spawn(
+        fn=_worker_allgather_missing_metric,
+        args=(2, rendezvous_file),
+        nprocs=2,
+        join=True,
+    )
 
 
 def _worker_mean(rank: int, world_size: int, rendezvous_file: str):
