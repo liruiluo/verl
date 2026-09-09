@@ -76,6 +76,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+class RecoverableRolloutError(RuntimeError):
+    """Signal that the exact rollout sample may be retried by its owner.
+
+    Agent loops should raise this only after exhausting their own bounded,
+    attempt-local recovery. The fully-async rollouter keeps the same scheduled
+    sample in flight and may retry it without emitting partial PPO rows.
+    """
+
+
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 

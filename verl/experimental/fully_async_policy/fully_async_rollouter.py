@@ -15,6 +15,7 @@
 import asyncio
 import collections
 import logging
+import math
 import os
 import time
 from pprint import pformat
@@ -24,7 +25,10 @@ import ray
 import torch
 from omegaconf import DictConfig, open_dict
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopManager,
+    RecoverableRolloutError,
+)
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     extract_scalar_sample_metadata,
@@ -50,6 +54,40 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+MAX_RECOVERABLE_ROLLOUT_RETRIES = 16
+MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS = 60.0
+
+
+def _non_negative_int(value, *, name: str, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
+
+
+def _non_negative_float(value, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return normalized
+
+
+def _bounded_recoverable_backoff(base_seconds: float, retry_index: int) -> float:
+    """Return capped exponential backoff without constructing huge powers."""
+
+    if retry_index <= 0:
+        raise ValueError("recoverable rollout retry index must be positive")
+    value = min(base_seconds, MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS)
+    for _ in range(retry_index - 1):
+        if value >= MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS / 2.0:
+            return MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS
+        value *= 2.0
+    return min(value, MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS)
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
@@ -424,6 +462,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.concurrent_samples_per_replica: int = config.async_training.get("concurrent_samples_per_replica", 16)
+        self.recoverable_rollout_max_retries = _non_negative_int(
+            config.async_training.get("recoverable_rollout_max_retries", 0),
+            name="async_training.recoverable_rollout_max_retries",
+            maximum=MAX_RECOVERABLE_ROLLOUT_RETRIES,
+        )
+        self.recoverable_rollout_backoff_seconds = _non_negative_float(
+            config.async_training.get("recoverable_rollout_backoff_seconds", 0.0),
+            name="async_training.recoverable_rollout_backoff_seconds",
+        )
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -438,11 +485,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.rollout_completed_samples = 0
         self.rollout_failed_samples = 0
         self.rollout_cancelled_samples = 0
+        self.rollout_recovery_attempts = 0
+        self.rollout_recovered_samples = 0
+        self.rollout_recovery_exhausted_samples = 0
         self.rollout_dispatched_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_inflight_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_completed_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_failed_by_data_source: collections.Counter[str] = collections.Counter()
         self.rollout_cancelled_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_recovery_attempts_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_recovered_by_data_source: collections.Counter[str] = collections.Counter()
+        self.rollout_recovery_exhausted_by_data_source: collections.Counter[str] = collections.Counter()
         # Kept as a compatibility metric. Queue overflow is not a stale-policy
         # rejection and is accounted separately below.
         self.dropped_stale_samples = 0
@@ -1040,9 +1093,55 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         data_source = str(rollout_sample.sample_metadata.get("data_source") or "__unlabeled__")
         self._record_rollout_dispatch(data_source)
         try:
-            ret = await self.async_rollout_manager.generate_sequences_single(
-                rollout_sample.full_batch
-            )
+            recovery_attempts = 0
+            while True:
+                try:
+                    ret = await self.async_rollout_manager.generate_sequences_single(
+                        rollout_sample.full_batch
+                    )
+                    break
+                except RecoverableRolloutError:
+                    if recovery_attempts >= self.recoverable_rollout_max_retries:
+                        # With recovery disabled there was no recovery attempt to
+                        # exhaust.  Once at least one retry ran, record one
+                        # exhausted sample for route-local finalization.
+                        if recovery_attempts:
+                            self.rollout_recovery_exhausted_samples += 1
+                            self.rollout_recovery_exhausted_by_data_source[
+                                data_source
+                            ] += 1
+                        logger.error(
+                            "Recoverable rollout retry budget exhausted for "
+                            "sample_id=%s data_source=%s after %d retries",
+                            rollout_sample.sample_id,
+                            data_source,
+                            recovery_attempts,
+                        )
+                        raise
+                    next_attempt = recovery_attempts + 1
+                    backoff = _bounded_recoverable_backoff(
+                        self.recoverable_rollout_backoff_seconds, next_attempt
+                    )
+                    logger.warning(
+                        "Retrying exact rollout sample_id=%s data_source=%s "
+                        "after recoverable failure (%d/%d), backoff=%.3fs",
+                        rollout_sample.sample_id,
+                        data_source,
+                        next_attempt,
+                        self.recoverable_rollout_max_retries,
+                        backoff,
+                    )
+                    if backoff > 0:
+                        await asyncio.sleep(backoff)
+                    # Count only retries that actually begin. Cancellation while
+                    # waiting in backoff remains a cancelled rollout, not an
+                    # attempted recovery.
+                    recovery_attempts = next_attempt
+                    self.rollout_recovery_attempts += 1
+                    self.rollout_recovery_attempts_by_data_source[data_source] += 1
+            if recovery_attempts:
+                self.rollout_recovered_samples += 1
+                self.rollout_recovered_by_data_source[data_source] += 1
 
             rollout_sample.full_batch = ret
             # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
@@ -1251,6 +1350,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "count/rollout_completed_samples": self.rollout_completed_samples,
             "count/rollout_failed_samples": self.rollout_failed_samples,
             "count/rollout_cancelled_samples": self.rollout_cancelled_samples,
+            "count/rollout_recovery_attempts": self.rollout_recovery_attempts,
+            "count/rollout_recovered_samples": self.rollout_recovered_samples,
+            "count/rollout_recovery_exhausted_samples": (
+                self.rollout_recovery_exhausted_samples
+            ),
             "count/queue_enqueued_samples": queue_stats["total_produced"],
             "count/queue_dequeued_samples": queue_stats["total_consumed"],
             "count/queue_overflow_evictions": queue_stats["dropped_samples"],
@@ -1271,6 +1375,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "rollout_completed": self.rollout_completed_by_data_source,
             "rollout_failed": self.rollout_failed_by_data_source,
             "rollout_cancelled": self.rollout_cancelled_by_data_source,
+            "rollout_recovery_attempt": self.rollout_recovery_attempts_by_data_source,
+            "rollout_recovered": self.rollout_recovered_by_data_source,
+            "rollout_recovery_exhausted": (
+                self.rollout_recovery_exhausted_by_data_source
+            ),
             "queue_enqueued": queue_stats["enqueued_by_data_source"],
             "queue_dequeued": queue_stats["consumed_by_data_source"],
             "queue_overflow_evicted": queue_stats["evicted_by_data_source"],

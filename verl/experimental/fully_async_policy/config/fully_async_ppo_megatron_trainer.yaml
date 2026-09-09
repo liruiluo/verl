@@ -48,6 +48,11 @@ async_training:
   # Maximum number of concurrent generation requests per replica.
   concurrent_samples_per_replica: 16
 
+  # Retry the same exact scheduled sample only when its agent loop explicitly
+  # reports a recoverable rollout fault. Zero preserves fail-fast behavior.
+  recoverable_rollout_max_retries: 0
+  recoverable_rollout_backoff_seconds: 0.0
+
 # Rollout config
 rollout:
 

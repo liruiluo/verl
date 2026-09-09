@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl import DataProto
+from verl.experimental.agent_loop.agent_loop import RecoverableRolloutError
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     RolloutSample,
@@ -25,7 +26,14 @@ from verl.experimental.fully_async_policy.detach_utils import (
     extract_scalar_sample_metadata,
 )
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
-from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
+from verl.experimental.fully_async_policy.fully_async_rollouter import (
+    MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS,
+    MAX_RECOVERABLE_ROLLOUT_RETRIES,
+    FullyAsyncRollouter,
+    _bounded_recoverable_backoff,
+    _non_negative_float,
+    _non_negative_int,
+)
 from verl.experimental.fully_async_policy.fully_async_trainer import (
     FullyAsyncTrainer,
     TrainingStopException,
@@ -380,6 +388,47 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
         self.assertEqual(await run_fit_step("critic"), ["critic"])
         self.assertEqual(await run_fit_step("actor"), ["critic", "actor"])
 
+    def test_recoverable_rollout_config_rejects_invalid_values(self) -> None:
+        for value in (-1, True, 1.0, "1"):
+            with self.subTest(integer=value), self.assertRaisesRegex(
+                ValueError, "non-negative integer"
+            ):
+                _non_negative_int(
+                    value, name="async_training.recoverable_rollout_max_retries"
+                )
+        with self.assertRaisesRegex(ValueError, "must be at most"):
+            _non_negative_int(
+                MAX_RECOVERABLE_ROLLOUT_RETRIES + 1,
+                name="async_training.recoverable_rollout_max_retries",
+                maximum=MAX_RECOVERABLE_ROLLOUT_RETRIES,
+            )
+        self.assertEqual(
+            _non_negative_int(
+                MAX_RECOVERABLE_ROLLOUT_RETRIES,
+                name="async_training.recoverable_rollout_max_retries",
+                maximum=MAX_RECOVERABLE_ROLLOUT_RETRIES,
+            ),
+            MAX_RECOVERABLE_ROLLOUT_RETRIES,
+        )
+        for value in (-0.1, True, float("inf"), float("nan"), "1.0"):
+            with self.subTest(number=value), self.assertRaisesRegex(
+                ValueError, "finite non-negative number"
+            ):
+                _non_negative_float(
+                    value, name="async_training.recoverable_rollout_backoff_seconds"
+                )
+
+    def test_recoverable_rollout_backoff_is_bounded_without_overflow(self) -> None:
+        self.assertEqual(_bounded_recoverable_backoff(0.0, 1), 0.0)
+        self.assertEqual(_bounded_recoverable_backoff(0.25, 1), 0.25)
+        self.assertEqual(_bounded_recoverable_backoff(0.25, 4), 2.0)
+        self.assertEqual(
+            _bounded_recoverable_backoff(1e308, MAX_RECOVERABLE_ROLLOUT_RETRIES),
+            MAX_RECOVERABLE_ROLLOUT_BACKOFF_SECONDS,
+        )
+        with self.assertRaisesRegex(ValueError, "retry index must be positive"):
+            _bounded_recoverable_backoff(1.0, 0)
+
     async def test_rollout_route_lifecycle_has_one_terminal_outcome(self) -> None:
         async def get_statistics(self):
             return {}
@@ -399,11 +448,19 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
             rollouter.rollout_completed_samples = 0
             rollouter.rollout_failed_samples = 0
             rollouter.rollout_cancelled_samples = 0
+            rollouter.recoverable_rollout_max_retries = 1
+            rollouter.recoverable_rollout_backoff_seconds = 0.0
+            rollouter.rollout_recovery_attempts = 0
+            rollouter.rollout_recovered_samples = 0
+            rollouter.rollout_recovery_exhausted_samples = 0
             rollouter.rollout_dispatched_by_data_source = Counter()
             rollouter.rollout_inflight_by_data_source = Counter()
             rollouter.rollout_completed_by_data_source = Counter()
             rollouter.rollout_failed_by_data_source = Counter()
             rollouter.rollout_cancelled_by_data_source = Counter()
+            rollouter.rollout_recovery_attempts_by_data_source = Counter()
+            rollouter.rollout_recovered_by_data_source = Counter()
+            rollouter.rollout_recovery_exhausted_by_data_source = Counter()
             return rollouter
 
         async def succeed(batch):
@@ -458,6 +515,192 @@ class TestFullyAsyncTermination(IsolatedAsyncioTestCase):
         self.assertEqual(cancelled.rollout_cancelled_samples, 1)
         self.assertEqual(cancelled.rollout_inflight_samples, 0)
         self.assertEqual(cancelled.rollout_inflight_by_data_source["route-c"], 0)
+
+    async def test_recoverable_rollout_retries_the_same_sample_before_enqueue(self) -> None:
+        async def get_statistics(self):
+            return {}
+
+        attempts = []
+
+        async def transient(batch):
+            attempts.append(
+                (
+                    id(batch),
+                    tuple(batch.non_tensor_batch["uid"].tolist()),
+                    tuple(batch.non_tensor_batch["data_source"].tolist()),
+                )
+            )
+            if len(attempts) == 1:
+                raise RecoverableRolloutError("transient environment infrastructure fault")
+            return batch
+
+        rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+        rollouter.async_rollout_manager = SimpleNamespace(
+            generate_sequences_single=transient
+        )
+        rollouter.message_queue_client = _RouteRecordingQueueClient()
+        rollouter.get_statistics = MethodType(get_statistics, rollouter)
+        rollouter.total_generated_samples = 0
+        rollouter._step_generated_samples = 0
+        rollouter.processed_sample_count = 0
+        rollouter.rollout_dispatched_samples = 0
+        rollouter.rollout_inflight_samples = 0
+        rollouter.rollout_completed_samples = 0
+        rollouter.rollout_failed_samples = 0
+        rollouter.rollout_cancelled_samples = 0
+        rollouter.recoverable_rollout_max_retries = 1
+        rollouter.recoverable_rollout_backoff_seconds = 0.25
+        rollouter.rollout_recovery_attempts = 0
+        rollouter.rollout_recovered_samples = 0
+        rollouter.rollout_recovery_exhausted_samples = 0
+        rollouter.rollout_dispatched_by_data_source = Counter()
+        rollouter.rollout_inflight_by_data_source = Counter()
+        rollouter.rollout_completed_by_data_source = Counter()
+        rollouter.rollout_failed_by_data_source = Counter()
+        rollouter.rollout_cancelled_by_data_source = Counter()
+        rollouter.rollout_recovery_attempts_by_data_source = Counter()
+        rollouter.rollout_recovered_by_data_source = Counter()
+        rollouter.rollout_recovery_exhausted_by_data_source = Counter()
+
+        with patch(
+            "verl.experimental.fully_async_policy.fully_async_rollouter.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ) as sleep:
+            await rollouter._process_single_sample_streaming(
+                _rollout_sample("route-recoverable", [[1]], "same-schedule-row")
+            )
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(attempts[0][1], ("uid_same-schedule-row",))
+        sleep.assert_awaited_once_with(0.25)
+        self.assertEqual(len(rollouter.message_queue_client.samples), 1)
+        self.assertEqual(rollouter.rollout_dispatched_samples, 1)
+        self.assertEqual(rollouter.rollout_completed_samples, 1)
+        self.assertEqual(rollouter.rollout_failed_samples, 0)
+        self.assertEqual(rollouter.rollout_recovery_attempts, 1)
+        self.assertEqual(rollouter.rollout_recovered_samples, 1)
+        self.assertEqual(rollouter.rollout_recovery_exhausted_samples, 0)
+        self.assertEqual(
+            rollouter.rollout_recovery_attempts_by_data_source["route-recoverable"],
+            1,
+        )
+        self.assertEqual(
+            rollouter.rollout_recovered_by_data_source["route-recoverable"], 1
+        )
+
+    async def test_cancellation_during_recovery_backoff_is_not_counted_as_retry(self) -> None:
+        async def get_statistics(self):
+            return {}
+
+        async def transient(_batch):
+            raise RecoverableRolloutError("transient environment infrastructure fault")
+
+        rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+        rollouter.async_rollout_manager = SimpleNamespace(
+            generate_sequences_single=transient
+        )
+        rollouter.message_queue_client = _RouteRecordingQueueClient()
+        rollouter.get_statistics = MethodType(get_statistics, rollouter)
+        rollouter.total_generated_samples = 0
+        rollouter._step_generated_samples = 0
+        rollouter.processed_sample_count = 0
+        rollouter.rollout_dispatched_samples = 0
+        rollouter.rollout_inflight_samples = 0
+        rollouter.rollout_completed_samples = 0
+        rollouter.rollout_failed_samples = 0
+        rollouter.rollout_cancelled_samples = 0
+        rollouter.recoverable_rollout_max_retries = 1
+        rollouter.recoverable_rollout_backoff_seconds = 0.25
+        rollouter.rollout_recovery_attempts = 0
+        rollouter.rollout_recovered_samples = 0
+        rollouter.rollout_recovery_exhausted_samples = 0
+        rollouter.rollout_dispatched_by_data_source = Counter()
+        rollouter.rollout_inflight_by_data_source = Counter()
+        rollouter.rollout_completed_by_data_source = Counter()
+        rollouter.rollout_failed_by_data_source = Counter()
+        rollouter.rollout_cancelled_by_data_source = Counter()
+        rollouter.rollout_recovery_attempts_by_data_source = Counter()
+        rollouter.rollout_recovered_by_data_source = Counter()
+        rollouter.rollout_recovery_exhausted_by_data_source = Counter()
+
+        with (
+            patch(
+                "verl.experimental.fully_async_policy.fully_async_rollouter.asyncio.sleep",
+                new=mock.AsyncMock(side_effect=asyncio.CancelledError),
+            ),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await rollouter._process_single_sample_streaming(
+                _rollout_sample("route-cancelled-backoff", [[1]], "cancelled-backoff")
+            )
+
+        self.assertEqual(rollouter.rollout_recovery_attempts, 0)
+        self.assertEqual(rollouter.rollout_recovered_samples, 0)
+        self.assertEqual(rollouter.rollout_recovery_exhausted_samples, 0)
+        self.assertEqual(rollouter.rollout_cancelled_samples, 1)
+        self.assertEqual(rollouter.rollout_failed_samples, 0)
+        self.assertEqual(rollouter.rollout_inflight_samples, 0)
+        self.assertEqual(rollouter.message_queue_client.samples, [])
+
+    async def test_recoverable_rollout_exhaustion_remains_fail_closed(self) -> None:
+        async def get_statistics(self):
+            return {}
+
+        attempts = []
+
+        async def persistent(batch):
+            attempts.append(id(batch))
+            raise RecoverableRolloutError("persistent environment infrastructure fault")
+
+        rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
+        rollouter.async_rollout_manager = SimpleNamespace(
+            generate_sequences_single=persistent
+        )
+        rollouter.message_queue_client = _RouteRecordingQueueClient()
+        rollouter.get_statistics = MethodType(get_statistics, rollouter)
+        rollouter.total_generated_samples = 0
+        rollouter._step_generated_samples = 0
+        rollouter.processed_sample_count = 0
+        rollouter.rollout_dispatched_samples = 0
+        rollouter.rollout_inflight_samples = 0
+        rollouter.rollout_completed_samples = 0
+        rollouter.rollout_failed_samples = 0
+        rollouter.rollout_cancelled_samples = 0
+        rollouter.recoverable_rollout_max_retries = 1
+        rollouter.recoverable_rollout_backoff_seconds = 0.0
+        rollouter.rollout_recovery_attempts = 0
+        rollouter.rollout_recovered_samples = 0
+        rollouter.rollout_recovery_exhausted_samples = 0
+        rollouter.rollout_dispatched_by_data_source = Counter()
+        rollouter.rollout_inflight_by_data_source = Counter()
+        rollouter.rollout_completed_by_data_source = Counter()
+        rollouter.rollout_failed_by_data_source = Counter()
+        rollouter.rollout_cancelled_by_data_source = Counter()
+        rollouter.rollout_recovery_attempts_by_data_source = Counter()
+        rollouter.rollout_recovered_by_data_source = Counter()
+        rollouter.rollout_recovery_exhausted_by_data_source = Counter()
+
+        with self.assertRaisesRegex(
+            RecoverableRolloutError, "persistent environment infrastructure fault"
+        ):
+            await rollouter._process_single_sample_streaming(
+                _rollout_sample("route-persistent", [[1]], "same-failing-row")
+            )
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(rollouter.message_queue_client.samples, [])
+        self.assertEqual(rollouter.rollout_dispatched_samples, 1)
+        self.assertEqual(rollouter.rollout_completed_samples, 0)
+        self.assertEqual(rollouter.rollout_failed_samples, 1)
+        self.assertEqual(rollouter.rollout_recovery_attempts, 1)
+        self.assertEqual(rollouter.rollout_recovered_samples, 0)
+        self.assertEqual(rollouter.rollout_recovery_exhausted_samples, 1)
+        self.assertEqual(
+            rollouter.rollout_recovery_exhausted_by_data_source["route-persistent"],
+            1,
+        )
 
     async def test_rollouter_quiesces_inflight_producers_before_shutdown(self) -> None:
         rollouter = object.__new__(_local_actor_class(FullyAsyncRollouter))
@@ -686,11 +929,17 @@ class TestQueueDataSourceAccounting(IsolatedAsyncioTestCase):
         rollouter.rollout_completed_samples = 7
         rollouter.rollout_failed_samples = 1
         rollouter.rollout_cancelled_samples = 1
+        rollouter.rollout_recovery_attempts = 2
+        rollouter.rollout_recovered_samples = 1
+        rollouter.rollout_recovery_exhausted_samples = 1
         rollouter.rollout_dispatched_by_data_source = {"fast": 6, "slow": 4}
         rollouter.rollout_inflight_by_data_source = {"fast": 0, "slow": 1}
         rollouter.rollout_completed_by_data_source = {"fast": 5, "slow": 2}
         rollouter.rollout_failed_by_data_source = {"fast": 1}
         rollouter.rollout_cancelled_by_data_source = {"slow": 1}
+        rollouter.rollout_recovery_attempts_by_data_source = {"slow": 2}
+        rollouter.rollout_recovered_by_data_source = {"slow": 1}
+        rollouter.rollout_recovery_exhausted_by_data_source = {"fast": 1}
         rollouter.queue_overflow_evictions = 1
         rollouter.staleness_samples = 2
         rollouter.dropped_stale_samples = 0
@@ -710,6 +959,16 @@ class TestQueueDataSourceAccounting(IsolatedAsyncioTestCase):
         self.assertEqual(stats["count/rollout_dispatched_samples"], 10)
         self.assertEqual(stats["count/rollout_inflight_samples"], 1)
         self.assertEqual(stats["count/rollout_cancelled_samples"], 1)
+        self.assertEqual(stats["count/rollout_recovery_attempts"], 2)
+        self.assertEqual(stats["count/rollout_recovered_samples"], 1)
+        self.assertEqual(stats["count/rollout_recovery_exhausted_samples"], 1)
+        self.assertEqual(
+            stats["count/rollout_recovery_attempt/data_source/slow"], 2
+        )
+        self.assertEqual(stats["count/rollout_recovered/data_source/slow"], 1)
+        self.assertEqual(
+            stats["count/rollout_recovery_exhausted/data_source/fast"], 1
+        )
         self.assertEqual(
             stats["count/rollout_dispatched_samples"],
             stats["count/rollout_inflight_samples"]
